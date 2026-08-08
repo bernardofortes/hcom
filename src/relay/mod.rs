@@ -31,6 +31,11 @@ pub const DEFAULT_BROKERS: &[(&str, u16)] = &[
     ("test.mosquitto.org", 8886),
 ];
 
+/// Maximum complete MQTT v5 PUBLISH packet accepted by deployed HCOM peers.
+/// This includes fixed/variable headers, topic, properties, packet identifier,
+/// and the sealed payload; it is not merely a plaintext or ciphertext limit.
+pub const MAX_RELAY_PACKET_BYTES: usize = 128 * 1024;
+
 /// Threshold (seconds) after which a device with no state updates is considered offline.
 /// Used for reconnect detection, stale-device cleanup, and status display.
 pub const DEVICE_STALE_SECS: f64 = 90.0;
@@ -358,7 +363,16 @@ pub fn clear_relay_device_state(db: &HcomDb) {
 /// Values the worker writes to `relay_status` KV. Constants instead of literals
 /// so derivation precedence and KV producers can't drift on a typo.
 pub const RAW_STATUS_OK: &str = "ok";
+pub const RAW_STATUS_CONNECTED: &str = "connected";
+pub const RAW_STATUS_QUEUED: &str = "queued";
 pub const RAW_STATUS_ERROR: &str = "error";
+
+fn raw_status_has_live_broker(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some(RAW_STATUS_OK | RAW_STATUS_CONNECTED | RAW_STATUS_QUEUED)
+    )
+}
 
 /// Why a relay is in error, for the `RelayHealth::Error` variant. Readers can
 /// branch on this for nicer wording without having to reparse `detail`.
@@ -413,7 +427,9 @@ pub enum RelayHealth {
     /// (startup window between `write_pid_file` and the first main-loop tick).
     Starting { pid: u32 },
     /// Worker is alive, heartbeat is fresh, and the worker last self-reported
-    /// `relay_status=ok` — the only "all good" variant. Carries no payload:
+    /// a live broker connection. This says nothing about peer receipt; raw KV
+    /// distinguishes connected, queued, and broker-confirmed publication.
+    /// Carries no payload:
     /// the heartbeat age changes every tick by construction, so storing it
     /// here would defeat enum-equality short-circuiting in render diffing.
     /// Forensic age is in JSON's `raw.heartbeat_age_s`.
@@ -479,9 +495,9 @@ pub fn observe_relay(config: &HcomConfig, db: &HcomDb) -> RelayObservation {
 ///   4. pidfile present, pid dead                            → Error(StalePidfile, pid)
 ///   5. pidfile present, pid alive, heartbeat missing        → Starting { pid }
 ///   6. pidfile present, pid alive, heartbeat stale          → Stale { age, pid }
-///   7. pidfile present, pid alive, heartbeat fresh, ok      → Connected { age }
-///   8. pidfile present, pid alive, heartbeat fresh, !ok     → Starting { pid }
-///   9. no pidfile, raw_status="ok" (or fresh heartbeat)     → Error(Ghost)
+///   7. pidfile present, pid alive, heartbeat fresh, live    → Connected { age }
+///   8. pidfile present, pid alive, heartbeat fresh, !live   → Starting { pid }
+///   9. no pidfile, live status (or fresh heartbeat)         → Error(Ghost)
 ///   10. no pidfile, anything else                           → Waiting
 pub fn derive_relay_health(obs: &RelayObservation) -> RelayHealth {
     if !obs.configured {
@@ -513,7 +529,7 @@ pub fn derive_relay_health(obs: &RelayObservation) -> RelayHealth {
             None => RelayHealth::Starting { pid },
             Some(age) if age >= HEARTBEAT_STALE_SECS => RelayHealth::Stale { age_s: age, pid },
             Some(_) => {
-                if obs.raw_status.as_deref() == Some(RAW_STATUS_OK) {
+                if raw_status_has_live_broker(obs.raw_status.as_deref()) {
                     RelayHealth::Connected
                 } else {
                     // Ticking but no ConnAck yet — still coming up.
@@ -528,7 +544,7 @@ pub fn derive_relay_health(obs: &RelayObservation) -> RelayHealth {
             let hb_fresh = obs
                 .heartbeat_age_s
                 .is_some_and(|age| age < HEARTBEAT_STALE_SECS);
-            if hb_fresh || obs.raw_status.as_deref() == Some(RAW_STATUS_OK) {
+            if hb_fresh || raw_status_has_live_broker(obs.raw_status.as_deref()) {
                 RelayHealth::Error {
                     reason: RelayErrorReason::Ghost,
                     detail: obs.raw_error.clone(),
@@ -740,7 +756,7 @@ pub fn trigger_push() {
 ///
 /// `is_worker` should be true for daemon relay threads, false for CLI callers.
 /// Non-worker callers bail if a daemon is actively handling relay (relay_daemon_port set).
-/// On "ok", the caller claims ownership via relay_status_owner PID.
+/// On a live-broker status, the caller claims ownership via relay_status_owner PID.
 /// On error, only the owning PID (or non-daemon callers) can write.
 pub fn set_relay_status(db: &HcomDb, status: &str, error: Option<&str>, is_worker: bool) {
     let pid = std::process::id().to_string();
@@ -755,10 +771,10 @@ pub fn set_relay_status(db: &HcomDb, status: &str, error: Option<&str>, is_worke
         return;
     }
 
-    if status == RAW_STATUS_OK {
+    if raw_status_has_live_broker(Some(status)) {
         // Claim ownership and clear error
         safe_kv_set(db, "relay_status_owner", Some(&pid));
-        safe_kv_set(db, "relay_status", Some(RAW_STATUS_OK));
+        safe_kv_set(db, "relay_status", Some(status));
         safe_kv_set(db, "relay_last_error", None);
     } else {
         // Only write error if we own the status or daemon isn't active
@@ -1122,6 +1138,19 @@ mod tests {
     }
 
     #[test]
+    fn derive_live_broker_is_connected_before_and_during_publication() {
+        for raw_status in [RAW_STATUS_CONNECTED, RAW_STATUS_QUEUED] {
+            let o = RelayObservation {
+                pidfile: Some((334, true)),
+                heartbeat_age_s: Some(0.5),
+                raw_status: Some(raw_status.into()),
+                ..obs()
+            };
+            assert_eq!(derive_relay_health(&o), RelayHealth::Connected);
+        }
+    }
+
+    #[test]
     fn derive_connected_is_stable_across_heartbeat_ticks() {
         // Render diffing relies on PartialEq short-circuiting when health hasn't
         // meaningfully changed. If Connected carried the heartbeat age, every
@@ -1138,7 +1167,7 @@ mod tests {
     #[test]
     fn derive_08_pid_alive_heartbeat_fresh_status_not_ok_is_starting() {
         // Covers the startup window: worker is ticking but hasn't received ConnAck.
-        // raw_status is empty or "disconnected" — anything except "ok" or "error".
+        // raw_status is empty or "disconnected" — neither live nor an error.
         let o = RelayObservation {
             pidfile: Some((444, true)),
             heartbeat_age_s: Some(0.2),
@@ -1235,6 +1264,22 @@ mod tests {
                 safe_kv_get(&db, key).is_none(),
                 "{key} should be cleared after disable"
             );
+        }
+    }
+
+    #[test]
+    fn set_relay_status_preserves_each_live_broker_state() {
+        let db = test_db();
+        safe_kv_set(&db, "relay_last_error", Some("stale error"));
+
+        for status in [RAW_STATUS_CONNECTED, RAW_STATUS_QUEUED, RAW_STATUS_OK] {
+            set_relay_status(&db, status, None, true);
+            assert_eq!(safe_kv_get(&db, "relay_status").as_deref(), Some(status));
+            assert_eq!(
+                safe_kv_get(&db, "relay_status_owner").as_deref(),
+                Some(std::process::id().to_string().as_str())
+            );
+            assert!(safe_kv_get(&db, "relay_last_error").is_none());
         }
     }
 

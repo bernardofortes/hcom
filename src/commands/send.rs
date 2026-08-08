@@ -217,10 +217,10 @@ impl SendArgs {
 /// Get formatted recipient feedback showing who received the message.
 fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
     if delivered_to.is_empty() {
-        return format!("Sent to: {SENDER}");
+        return format!("Queued for: {SENDER}");
     }
     if delivered_to.len() > 10 {
-        return format!("Sent to {} agents", delivered_to.len());
+        return format!("Queued for {} agents", delivered_to.len());
     }
 
     let mut parts = Vec::new();
@@ -233,7 +233,7 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
             parts.push(format!("◌ {name}"));
         }
     }
-    format!("Sent to: {}", parts.join(", "))
+    format!("Queued for: {}", parts.join(", "))
 }
 
 struct ResolvedDelivery {

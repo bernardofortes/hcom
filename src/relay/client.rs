@@ -4,9 +4,10 @@
 //! Manual exponential backoff on connection errors pauses that polling thread
 //! so reconnect attempts do not hammer public brokers.
 
+use rumqttc::Outgoing;
 use rumqttc::TlsConfiguration;
 use rumqttc::v5::mqttbytes::QoS;
-use rumqttc::v5::mqttbytes::v5::Packet;
+use rumqttc::v5::mqttbytes::v5::{Packet, PubAck, PubAckReason};
 use rumqttc::v5::{Client, Connection, Event, MqttOptions};
 use rustls::RootCertStore;
 use rustls_native_certs::load_native_certs;
@@ -21,8 +22,8 @@ use serde_json::json;
 
 use super::replay::ReplayGuard;
 use super::{
-    get_broker_from_config, is_relay_enabled, load_psk, read_device_uuid, set_relay_status,
-    state_topic, wildcard_topic,
+    MAX_RELAY_PACKET_BYTES, get_broker_from_config, is_relay_enabled, load_psk, read_device_uuid,
+    set_relay_status, state_topic, wildcard_topic,
 };
 
 /// Build a TLS config that combines webpki-roots (bundled Mozilla CAs for Android/Termux
@@ -92,6 +93,84 @@ impl Backoff {
     }
 }
 
+const STATE_PUBACK_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct PendingStatePublish {
+    prepared: super::push::PreparedPush,
+    packet_id: Option<u16>,
+    queued_at: Instant,
+}
+
+impl PendingStatePublish {
+    fn new(prepared: super::push::PreparedPush) -> Self {
+        Self {
+            prepared,
+            packet_id: None,
+            queued_at: Instant::now(),
+        }
+    }
+
+    fn observe_outgoing_publish(&mut self, packet_id: u16) -> Result<(), String> {
+        match self.packet_id {
+            None => {
+                self.packet_id = Some(packet_id);
+                Ok(())
+            }
+            Some(expected) if expected == packet_id => Ok(()),
+            Some(expected) => Err(format!(
+                "relay state publication expected MQTT packet id {expected}, observed outgoing id {packet_id}"
+            )),
+        }
+    }
+
+    fn timed_out(&self, now: Instant) -> bool {
+        now.duration_since(self.queued_at) >= STATE_PUBACK_TIMEOUT
+    }
+}
+
+enum PubAckTransition {
+    Unrelated,
+    Wrong(String),
+    Rejected(String),
+    Confirmed(super::push::PreparedPush),
+}
+
+fn apply_puback(pending: &mut Option<PendingStatePublish>, ack: &PubAck) -> PubAckTransition {
+    let Some(current) = pending.as_ref() else {
+        return PubAckTransition::Unrelated;
+    };
+    let Some(expected) = current.packet_id else {
+        return PubAckTransition::Wrong(format!(
+            "received PUBACK {} before the relay state publication was assigned a packet id",
+            ack.pkid
+        ));
+    };
+    if ack.pkid != expected {
+        return PubAckTransition::Wrong(format!(
+            "received PUBACK {} while relay state publication {expected} is pending",
+            ack.pkid
+        ));
+    }
+    if !matches!(
+        ack.reason,
+        PubAckReason::Success | PubAckReason::NoMatchingSubscribers
+    ) {
+        let reason = format!(
+            "broker rejected relay state publication {expected}: {:?}",
+            ack.reason
+        );
+        *pending = None;
+        return PubAckTransition::Rejected(reason);
+    }
+
+    PubAckTransition::Confirmed(
+        pending
+            .take()
+            .expect("matching PUBACK requires a pending publication")
+            .prepared,
+    )
+}
+
 /// MQTT relay client. Manages connection, subscriptions, push/pull, and lifecycle.
 pub struct MqttRelay {
     client: Client,
@@ -141,7 +220,9 @@ impl MqttRelay {
         let mut mqttoptions = MqttOptions::new(&client_id, &host, port);
         mqttoptions.set_keep_alive(Duration::from_secs(30));
         mqttoptions.set_clean_start(true);
-        mqttoptions.set_max_packet_size(Some(128 * 1024));
+        // MQTT v5 advertises this as the maximum packet we accept inbound.
+        // Outgoing relay-state packets are separately measured in push.rs.
+        mqttoptions.set_max_packet_size(Some(MAX_RELAY_PACKET_BYTES as u32));
 
         // TLS
         if use_tls {
@@ -236,6 +317,7 @@ impl MqttRelay {
         let mut backoff_until = Instant::now();
         let mut last_push = Instant::now();
         let mut pending_push_at: Option<Instant> = None;
+        let mut pending_state_publish: Option<PendingStatePublish> = None;
         let mut connected = false;
         // Track last time we received ANY event (success or error) from the
         // connection thread. If this goes stale, the connection thread is dead
@@ -272,17 +354,17 @@ impl MqttRelay {
             match self.cmd_rx.try_recv() {
                 Ok(RelayCommand::Shutdown) => {
                     log::log_info("relay", "relay.shutdown", "shutdown requested");
-                    self.shutdown_graceful(&event_rx);
+                    self.shutdown_graceful(&event_rx, &mut pending_state_publish);
                     return;
                 }
                 Ok(RelayCommand::Push) => {
-                    self.do_push_cycle(connected);
+                    self.do_push_cycle(connected, &mut pending_state_publish);
                     last_push = Instant::now();
                     pending_push_at = None;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     log::log_info("relay", "relay.shutdown", "command channel closed");
-                    self.shutdown_graceful(&event_rx);
+                    self.shutdown_graceful(&event_rx, &mut pending_state_publish);
                     return;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -290,15 +372,37 @@ impl MqttRelay {
 
             // Periodic push
             if connected && last_push.elapsed() >= self.push_interval {
-                self.do_push_cycle(connected);
+                self.do_push_cycle(connected, &mut pending_state_publish);
                 last_push = Instant::now();
                 pending_push_at = None;
             }
 
             if connected && pending_push_at.is_some_and(|deadline| Instant::now() >= deadline) {
-                self.do_push_cycle(connected);
+                self.do_push_cycle(connected, &mut pending_state_publish);
                 last_push = Instant::now();
                 pending_push_at = None;
+            }
+
+            if pending_state_publish
+                .as_ref()
+                .is_some_and(|pending| pending.timed_out(Instant::now()))
+            {
+                let packet_id = pending_state_publish
+                    .as_ref()
+                    .and_then(|pending| pending.packet_id)
+                    .map_or_else(|| "unassigned".to_string(), |id| id.to_string());
+                let err = format!(
+                    "timed out after {}s waiting for PUBACK for relay state publication {packet_id}; cursor unchanged",
+                    STATE_PUBACK_TIMEOUT.as_secs()
+                );
+                if let Ok(db) = HcomDb::open() {
+                    set_relay_status(&db, "error", Some(&err), true);
+                }
+                log::log_warn("relay", "relay.push_timeout", &err);
+                // Drop this event loop rather than enqueueing a duplicate while
+                // rumqttc may still regard the original QoS 1 packet as inflight.
+                let _ = self.client.disconnect();
+                return;
             }
 
             // During backoff, skip event processing and just sleep.
@@ -328,7 +432,7 @@ impl MqttRelay {
                 if let Ok(db) = HcomDb::open() {
                     set_relay_status(&db, "error", Some("liveness timeout"), true);
                 }
-                self.shutdown_graceful(&event_rx);
+                self.shutdown_graceful(&event_rx, &mut pending_state_publish);
                 return;
             }
 
@@ -352,7 +456,7 @@ impl MqttRelay {
                         backoff.reset();
                         last_event_from_conn = Instant::now();
                         consecutive_errors = 0;
-                        if self.handle_event(event, &mut connected) {
+                        if self.handle_event(event, &mut connected, &mut pending_state_publish) {
                             trigger_push = true;
                         }
                     }
@@ -380,6 +484,10 @@ impl MqttRelay {
                             if let Ok(db) = HcomDb::open() {
                                 set_relay_status(&db, "error", Some(&err_msg), true);
                             }
+                        } else if pending_state_publish.is_some()
+                            && let Ok(db) = HcomDb::open()
+                        {
+                            set_relay_status(&db, "error", Some(&err_msg), true);
                         }
                     }
                     Err(mpsc::TryRecvError::Empty) => {
@@ -394,7 +502,7 @@ impl MqttRelay {
             }
             if channel_disconnected {
                 log::log_info("relay", "relay.shutdown", "connection thread ended");
-                self.shutdown_graceful(&event_rx);
+                self.shutdown_graceful(&event_rx, &mut pending_state_publish);
                 return;
             }
 
@@ -419,7 +527,7 @@ impl MqttRelay {
                         backoff.reset();
                         last_event_from_conn = Instant::now();
                         consecutive_errors = 0;
-                        if self.handle_event(event, &mut connected) {
+                        if self.handle_event(event, &mut connected, &mut pending_state_publish) {
                             let next_push = last_push + Self::INBOUND_PUSH_DEBOUNCE;
                             pending_push_at = Some(
                                 pending_push_at
@@ -448,6 +556,10 @@ impl MqttRelay {
                             if let Ok(db) = HcomDb::open() {
                                 set_relay_status(&db, "error", Some(&err_msg), true);
                             }
+                        } else if pending_state_publish.is_some()
+                            && let Ok(db) = HcomDb::open()
+                        {
+                            set_relay_status(&db, "error", Some(&err_msg), true);
                         }
                         backoff_until = Instant::now() + backoff.wait_duration();
                         backoff.increase();
@@ -457,7 +569,7 @@ impl MqttRelay {
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         log::log_info("relay", "relay.shutdown", "connection thread ended");
-                        self.shutdown_graceful(&event_rx);
+                        self.shutdown_graceful(&event_rx, &mut pending_state_publish);
                         return;
                     }
                 }
@@ -466,21 +578,26 @@ impl MqttRelay {
     }
 
     /// Handle a single MQTT event.
-    fn handle_event(&self, event: Event, connected: &mut bool) -> bool {
+    fn handle_event(
+        &self,
+        event: Event,
+        connected: &mut bool,
+        pending_state_publish: &mut Option<PendingStatePublish>,
+    ) -> bool {
         match event {
             Event::Incoming(incoming) => match incoming {
                 Packet::ConnAck(_connack) => {
                     *connected = true;
                     log::log_info("relay", "relay.connected", "MQTT connected");
                     if let Ok(db) = HcomDb::open() {
-                        set_relay_status(&db, "ok", None, true);
+                        set_relay_status(&db, "connected", None, true);
                     }
                     // Re-subscribe after reconnect
                     if let Err(e) = self.subscribe() {
                         log::log_warn("relay", "relay.subscribe_err", &e);
                     }
                     // Push immediately on connect to sync state
-                    self.do_push_cycle(true);
+                    self.do_push_cycle(true, pending_state_publish);
                     false
                 }
                 Packet::Publish(publish) => {
@@ -490,12 +607,54 @@ impl MqttRelay {
                 }
                 Packet::Disconnect(_) => {
                     *connected = false;
-                    log::log_info("relay", "relay.disconnected", "server disconnect");
+                    let err = "broker disconnected before relay state confirmation";
+                    if pending_state_publish.is_some()
+                        && let Ok(db) = HcomDb::open()
+                    {
+                        set_relay_status(&db, "error", Some(err), true);
+                    }
+                    log::log_info("relay", "relay.disconnected", err);
                     false
                 }
-                _ => false, // PingResp, SubAck, PubAck — ignore
+                Packet::PubAck(ack) => match apply_puback(pending_state_publish, &ack) {
+                    PubAckTransition::Unrelated => false,
+                    PubAckTransition::Wrong(err) | PubAckTransition::Rejected(err) => {
+                        log::log_warn("relay", "relay.puback_err", &err);
+                        if let Ok(db) = HcomDb::open() {
+                            set_relay_status(&db, "error", Some(&err), true);
+                        }
+                        false
+                    }
+                    PubAckTransition::Confirmed(prepared) => {
+                        let has_more = prepared.has_more;
+                        match HcomDb::open() {
+                            Ok(db) => super::push::commit_broker_confirmed(&db, &prepared),
+                            Err(e) => {
+                                let err = format!(
+                                    "broker confirmed relay state publication but cursor commit failed: {e}"
+                                );
+                                log::log_error("relay", "relay.cursor_commit_err", &err);
+                                return false;
+                            }
+                        }
+                        has_more
+                    }
+                },
+                _ => false, // PingResp, SubAck, and other control packets
             },
-            Event::Outgoing(_) => false, // Outgoing events — ignore
+            Event::Outgoing(Outgoing::Publish(packet_id)) => {
+                let Some(pending) = pending_state_publish.as_mut() else {
+                    return false;
+                };
+                if let Err(err) = pending.observe_outgoing_publish(packet_id) {
+                    log::log_warn("relay", "relay.publish_id_err", &err);
+                    if let Ok(db) = HcomDb::open() {
+                        set_relay_status(&db, "error", Some(&err), true);
+                    }
+                }
+                false
+            }
+            Event::Outgoing(_) => false,
         }
     }
 
@@ -595,8 +754,18 @@ impl MqttRelay {
         }
     }
 
-    /// Execute a push cycle: build state + events, publish to MQTT.
-    fn do_push_cycle(&self, mqtt_connected: bool) {
+    /// Prepare and enqueue at most one state publication. Confirmation and
+    /// serial draining are driven later by Outgoing::Publish and PUBACK events;
+    /// this function never waits inside the MQTT event loop.
+    fn do_push_cycle(
+        &self,
+        mqtt_connected: bool,
+        pending_state_publish: &mut Option<PendingStatePublish>,
+    ) {
+        if pending_state_publish.is_some() {
+            return;
+        }
+
         let db = match HcomDb::open() {
             Ok(db) => db,
             Err(e) => {
@@ -614,34 +783,37 @@ impl MqttRelay {
             }
         };
 
-        // Drain loop with 10s budget
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match super::push::push(
-                &db,
-                &self.client,
-                &self.relay_id,
-                &self.device_uuid,
-                &psk,
-                true,
-                mqtt_connected,
-            ) {
-                Ok((true, has_more)) => {
-                    if has_more && Instant::now() < deadline {
-                        continue; // More events to drain
-                    }
-                    break;
-                }
-                Ok((false, _)) => break,
-                Err(e) => {
-                    log::log_warn("relay", "relay.push_err", &e);
-                    if let Ok(db) = HcomDb::open() {
-                        set_relay_status(&db, "error", Some(&e), true);
-                    }
-                    break;
-                }
-            }
+        if !mqtt_connected {
+            let err = "relay state publication not queued: MQTT is disconnected; cursor unchanged";
+            set_relay_status(&db, "error", Some(err), true);
+            log::log_warn("relay", "relay.push_disconnected", err);
+            return;
         }
+
+        let prepared = match super::push::prepare_push(&db, &self.relay_id, &self.device_uuid, &psk)
+        {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                log::log_warn("relay", "relay.push_err", &e);
+                set_relay_status(&db, "error", Some(&e), true);
+                return;
+            }
+        };
+
+        if let Err(e) = self.client.publish(
+            &prepared.topic,
+            QoS::AtLeastOnce,
+            true,
+            prepared.sealed.clone(),
+        ) {
+            let err = format!("publish enqueue failed: {e}");
+            log::log_warn("relay", "relay.push_err", &err);
+            set_relay_status(&db, "error", Some(&err), true);
+            return;
+        }
+
+        super::push::record_queued(&db, &prepared);
+        *pending_state_publish = Some(PendingStatePublish::new(prepared));
     }
 
     /// Graceful shutdown: publish an authenticated retained tombstone, wait for
@@ -649,7 +821,63 @@ impl MqttRelay {
     fn shutdown_graceful(
         &self,
         event_rx: &mpsc::Receiver<Result<Event, rumqttc::v5::ConnectionError>>,
+        pending_state_publish: &mut Option<PendingStatePublish>,
     ) {
+        // Do not put the retained tombstone in flight beside a normal state
+        // publication. Finish the exact pending QoS 1 exchange first.
+        let mut normal_confirmed = pending_state_publish.is_none();
+        let pending_deadline = Instant::now() + Duration::from_secs(5);
+        while !normal_confirmed && Instant::now() < pending_deadline {
+            match event_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Ok(Event::Outgoing(Outgoing::Publish(packet_id)))) => {
+                    if let Some(pending) = pending_state_publish.as_mut()
+                        && let Err(err) = pending.observe_outgoing_publish(packet_id)
+                    {
+                        log::log_warn("relay", "relay.shutdown_publish_id_err", &err);
+                    }
+                }
+                Ok(Ok(Event::Incoming(Packet::PubAck(ack)))) => {
+                    match apply_puback(pending_state_publish, &ack) {
+                        PubAckTransition::Unrelated | PubAckTransition::Wrong(_) => {}
+                        PubAckTransition::Rejected(err) => {
+                            log::log_warn("relay", "relay.shutdown_puback_err", &err);
+                            break;
+                        }
+                        PubAckTransition::Confirmed(prepared) => {
+                            if let Ok(db) = HcomDb::open() {
+                                super::push::commit_broker_confirmed(&db, &prepared);
+                            }
+                            normal_confirmed = true;
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    log::log_warn("relay", "relay.shutdown_pending_err", &format!("{err:?}"));
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                _ => {}
+            }
+        }
+
+        if !normal_confirmed {
+            log::log_warn(
+                "relay",
+                "relay.shutdown_pending_unconfirmed",
+                "normal relay state publication remains unconfirmed; tombstone not queued",
+            );
+            let _ = self.client.disconnect();
+            if let Ok(db) = HcomDb::open() {
+                set_relay_status(
+                    &db,
+                    "error",
+                    Some("shutdown before relay state PUBACK; cursor unchanged"),
+                    true,
+                );
+            }
+            return;
+        }
+
         let topic = state_topic(&self.relay_id, &self.device_uuid);
         log::log_info(
             "relay",
@@ -671,11 +899,23 @@ impl MqttRelay {
         if let Err(e) = publish_result {
             log::log_warn("relay", "relay.shutdown_publish_err", &e);
         } else {
-            // Wait for PUBACK (up to 5s) by draining the event channel
+            // Wait for the tombstone's matching PUBACK (up to 5s).
             let deadline = Instant::now() + Duration::from_secs(5);
+            let mut tombstone_packet_id = None;
             while Instant::now() < deadline {
                 match event_rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(Ok(Event::Incoming(Packet::PubAck(_)))) => break,
+                    Ok(Ok(Event::Outgoing(Outgoing::Publish(packet_id)))) => {
+                        tombstone_packet_id = Some(packet_id);
+                    }
+                    Ok(Ok(Event::Incoming(Packet::PubAck(ack))))
+                        if tombstone_packet_id == Some(ack.pkid)
+                            && matches!(
+                                ack.reason,
+                                PubAckReason::Success | PubAckReason::NoMatchingSubscribers
+                            ) =>
+                    {
+                        break;
+                    }
                     Ok(Err(_)) => break, // Connection error
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     _ => continue, // Other events or timeout — keep waiting
@@ -722,8 +962,10 @@ fn seal_state_tombstone(psk: &[u8; 32], relay_id: &str, topic: &str) -> Result<V
     }))
     .map_err(|e| format!("failed to serialize state tombstone: {e}"))?;
     let ts_secs = crate::shared::time::now_epoch_f64() as u64;
-    super::crypto::seal(psk, relay_id, topic, &payload, ts_secs)
-        .map_err(|e| format!("failed to seal state tombstone: {e}"))
+    let sealed = super::crypto::seal(psk, relay_id, topic, &payload, ts_secs)
+        .map_err(|e| format!("failed to seal state tombstone: {e}"))?;
+    super::push::ensure_complete_publish_packet_size(topic, &sealed)?;
+    Ok(sealed)
 }
 
 /// Tracks PUBACK or connection error for an ephemeral publish.
@@ -794,6 +1036,7 @@ pub fn create_ephemeral_client(config: &HcomConfig) -> Option<EphemeralClient> {
     let mut mqttoptions = MqttOptions::new(&client_id, &host, port);
     mqttoptions.set_keep_alive(Duration::from_secs(10));
     mqttoptions.set_clean_start(true);
+    mqttoptions.set_max_packet_size(Some(MAX_RELAY_PACKET_BYTES as u32));
 
     if use_tls {
         mqttoptions.set_transport(rumqttc::Transport::tls_with_config(relay_tls_config()));
@@ -908,7 +1151,122 @@ pub fn clear_retained_state(config: &HcomConfig) -> bool {
 mod tests {
     use super::*;
     use crate::hooks::test_helpers::isolated_test_env;
+    use crate::relay::safe_kv_get;
     use serial_test::serial;
+
+    fn prepared_push(max_event_id: i64, has_more: bool) -> super::super::push::PreparedPush {
+        super::super::push::PreparedPush {
+            topic: "relay-test/device-a".to_string(),
+            sealed: vec![1, 2, 3],
+            packet_bytes: 32,
+            event_count: 1,
+            max_event_id,
+            has_more,
+        }
+    }
+
+    #[test]
+    fn missing_wrong_and_matching_puback_gate_cursor_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let prepared = prepared_push(42, true);
+
+        // Mirrors the active ConnAck and enqueue producers. Neither state is a
+        // broker confirmation, so both must remain distinguishable from `ok`.
+        set_relay_status(&db, super::super::RAW_STATUS_CONNECTED, None, true);
+        assert_eq!(
+            safe_kv_get(&db, "relay_status").as_deref(),
+            Some(super::super::RAW_STATUS_CONNECTED)
+        );
+        super::super::push::record_queued(&db, &prepared);
+        assert_eq!(
+            safe_kv_get(&db, "relay_status").as_deref(),
+            Some(super::super::RAW_STATUS_QUEUED)
+        );
+
+        let mut pending = Some(PendingStatePublish::new(prepared));
+
+        pending
+            .as_mut()
+            .unwrap()
+            .observe_outgoing_publish(7)
+            .unwrap();
+        assert!(safe_kv_get(&db, "relay_last_push_id").is_none());
+        assert!(pending.is_some(), "missing PUBACK must stay pending");
+        assert_eq!(
+            safe_kv_get(&db, "relay_status").as_deref(),
+            Some(super::super::RAW_STATUS_QUEUED)
+        );
+
+        let wrong = PubAck::new(8, None);
+        assert!(matches!(
+            apply_puback(&mut pending, &wrong),
+            PubAckTransition::Wrong(_)
+        ));
+        assert!(
+            pending.is_some(),
+            "wrong PUBACK must not release the publication"
+        );
+        assert!(safe_kv_get(&db, "relay_last_push_id").is_none());
+        assert!(safe_kv_get(&db, "relay_last_sync").is_none());
+        assert_eq!(
+            safe_kv_get(&db, "relay_status").as_deref(),
+            Some(super::super::RAW_STATUS_QUEUED)
+        );
+
+        let matching = PubAck::new(7, None);
+        let prepared = match apply_puback(&mut pending, &matching) {
+            PubAckTransition::Confirmed(prepared) => prepared,
+            _ => panic!("matching successful PUBACK should confirm the publication"),
+        };
+        assert!(pending.is_none());
+        assert!(safe_kv_get(&db, "relay_last_push_id").is_none());
+        assert_eq!(
+            safe_kv_get(&db, "relay_status").as_deref(),
+            Some(super::super::RAW_STATUS_QUEUED),
+            "matching PUBACK is not persisted as confirmed until its prepared payload commits"
+        );
+
+        super::super::push::commit_broker_confirmed(&db, &prepared);
+        assert_eq!(
+            safe_kv_get(&db, "relay_last_push_id").as_deref(),
+            Some("42")
+        );
+        assert!(safe_kv_get(&db, "relay_last_sync").is_some());
+        assert_eq!(
+            safe_kv_get(&db, "relay_status").as_deref(),
+            Some(super::super::RAW_STATUS_OK)
+        );
+        assert!(prepared.has_more);
+    }
+
+    #[test]
+    fn rejected_puback_releases_for_retry_without_cursor_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let mut pending = Some(PendingStatePublish::new(prepared_push(9, false)));
+        pending
+            .as_mut()
+            .unwrap()
+            .observe_outgoing_publish(3)
+            .unwrap();
+        let mut ack = PubAck::new(3, None);
+        ack.reason = PubAckReason::QuotaExceeded;
+
+        assert!(matches!(
+            apply_puback(&mut pending, &ack),
+            PubAckTransition::Rejected(_)
+        ));
+        assert!(pending.is_none());
+        assert!(safe_kv_get(&db, "relay_last_push_id").is_none());
+    }
+
+    #[test]
+    fn pending_publication_timeout_is_bounded() {
+        let mut pending = PendingStatePublish::new(prepared_push(1, false));
+        pending.queued_at = Instant::now() - STATE_PUBACK_TIMEOUT;
+        assert!(pending.timed_out(Instant::now()));
+    }
 
     #[test]
     #[serial]

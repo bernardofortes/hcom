@@ -12,6 +12,10 @@ pub(crate) fn get_archive_timestamp() -> String {
 /// Archive the current database to ~/.hcom/archive/session-{timestamp}/.
 pub(crate) fn archive_and_clear_db() -> Result<Option<String>, String> {
     let base = hcom_dir();
+    archive_and_clear_db_at(&base)
+}
+
+fn archive_and_clear_db_at(base: &std::path::Path) -> Result<Option<String>, String> {
     let db_file = base.join("hcom.db");
     let db_wal = base.join("hcom.db-wal");
     let db_shm = base.join("hcom.db-shm");
@@ -245,5 +249,35 @@ mod tests {
         let err = remove_database_files(&db_path, &wal_path, &shm_path).unwrap_err();
         assert!(err.contains("could not remove"));
         assert!(err.contains("Stop other hcom processes"));
+    }
+
+    #[test]
+    fn populated_wal_database_is_archived_and_all_database_files_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hcom.db");
+        let db = HcomDb::open_at(&db_path).unwrap();
+        db.log_event("message", "sender", &serde_json::json!({"text": "kept"}))
+            .unwrap();
+        db.conn()
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap();
+        drop(db);
+
+        let archive = archive_and_clear_db_at(dir.path())
+            .unwrap()
+            .expect("populated database should be archived");
+        let archive = std::path::PathBuf::from(archive);
+
+        assert!(archive.join("hcom.db").is_file());
+        assert!(!db_path.exists());
+        assert!(!dir.path().join("hcom.db-wal").exists());
+        assert!(!dir.path().join("hcom.db-shm").exists());
+
+        let archived = HcomDb::open_at(&archive.join("hcom.db")).unwrap();
+        let event_count: i64 = archived
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count, 1);
     }
 }
