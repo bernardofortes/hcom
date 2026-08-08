@@ -144,6 +144,17 @@ fn apply_puback(pending: &mut Option<PendingStatePublish>, ack: &PubAck) -> PubA
     )
 }
 
+fn release_pending_on_new_session(
+    pending: &mut Option<PendingStatePublish>,
+    session_present: bool,
+) -> bool {
+    if session_present {
+        return false;
+    }
+
+    pending.take().is_some()
+}
+
 /// MQTT relay client. Manages connection, subscriptions, push/pull, and lifecycle.
 pub struct MqttRelay {
     client: Client,
@@ -559,7 +570,22 @@ impl MqttRelay {
     ) -> bool {
         match event {
             Event::Incoming(incoming) => match incoming {
-                Packet::ConnAck(_connack) => {
+                Packet::ConnAck(connack) => {
+                    // rumqttc clears its own unacknowledged queue before
+                    // emitting a CONNACK for a new session. Mirror that exact
+                    // boundary so the unchanged durable cursor can be prepared
+                    // and published again below. A resumed session keeps the
+                    // pending publication for rumqttc's retransmission.
+                    if release_pending_on_new_session(
+                        pending_state_publish,
+                        connack.session_present,
+                    ) {
+                        log::log_warn(
+                            "relay",
+                            "relay.push_retry",
+                            "MQTT reconnect started a new session before relay state confirmation; retrying from unchanged cursor",
+                        );
+                    }
                     *connected = true;
                     log::log_info("relay", "relay.connected", "MQTT connected");
                     if let Ok(db) = HcomDb::open() {
@@ -1232,6 +1258,74 @@ mod tests {
         ));
         assert!(pending.is_none());
         assert!(safe_kv_get(&db, "relay_last_push_id").is_none());
+    }
+
+    #[test]
+    fn new_session_releases_pending_publication_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let first = prepared_push(17, false);
+        super::super::push::record_queued(&db, &first);
+        let mut pending = Some(PendingStatePublish::new(first));
+        pending
+            .as_mut()
+            .unwrap()
+            .observe_outgoing_publish(4)
+            .unwrap();
+
+        set_relay_status(
+            &db,
+            "error",
+            Some("connection lost before PUBACK; cursor unchanged"),
+            true,
+        );
+        assert!(safe_kv_get(&db, "relay_last_push_id").is_none());
+        assert_eq!(safe_kv_get(&db, "relay_status").as_deref(), Some("error"));
+
+        assert!(release_pending_on_new_session(&mut pending, false));
+        assert!(pending.is_none());
+        assert!(safe_kv_get(&db, "relay_last_push_id").is_none());
+        assert_eq!(
+            safe_kv_get(&db, "relay_status").as_deref(),
+            Some("error"),
+            "releasing volatile pending state must not claim confirmation"
+        );
+
+        // Mirrors the immediate do_push_cycle on CONNACK. The cleared
+        // one-in-flight guard permits a fresh publication prepared from the
+        // same durable cursor, with a new packet identifier.
+        let retry = prepared_push(17, false);
+        super::super::push::record_queued(&db, &retry);
+        pending = Some(PendingStatePublish::new(retry));
+        pending
+            .as_mut()
+            .unwrap()
+            .observe_outgoing_publish(5)
+            .unwrap();
+        assert_eq!(pending.as_ref().unwrap().prepared.max_event_id, 17);
+        assert_eq!(pending.as_ref().unwrap().packet_id, Some(5));
+        assert!(safe_kv_get(&db, "relay_last_push_id").is_none());
+
+        let stale_ack = PubAck::new(4, None);
+        assert!(matches!(
+            apply_puback(&mut pending, &stale_ack),
+            PubAckTransition::Wrong(_)
+        ));
+        assert!(pending.is_some());
+        assert!(safe_kv_get(&db, "relay_last_push_id").is_none());
+    }
+
+    #[test]
+    fn resumed_session_keeps_pending_publication() {
+        let mut pending = Some(PendingStatePublish::new(prepared_push(23, false)));
+        pending
+            .as_mut()
+            .unwrap()
+            .observe_outgoing_publish(8)
+            .unwrap();
+
+        assert!(!release_pending_on_new_session(&mut pending, true));
+        assert_eq!(pending.as_ref().unwrap().packet_id, Some(8));
     }
 
     #[test]
