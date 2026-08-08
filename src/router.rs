@@ -690,6 +690,20 @@ fn launch_new_terminal() -> i32 {
 
 // ── Native command dispatch ──────────────────────────────────────────────
 
+/// Deliver unread messages after a non-destructive command while its router
+/// database handle is still valid.
+fn deliver_pending_messages_after_command(
+    db: &crate::db::HcomDb,
+    ctx: &crate::shared::CommandContext,
+    has_json: bool,
+) {
+    // Hookless Codex/adhoc instances have no delivery hook. Appending here is
+    // their delivery boundary; machine-readable output remains untouched.
+    if let Some(output) = crate::cli_context::maybe_deliver_pending_messages(db, ctx, has_json) {
+        print!("{output}");
+    }
+}
+
 /// Dispatch a natively-handled CLI command.
 ///
 /// Opens DB, builds CommandContext, calls the appropriate cmd_* function.
@@ -800,6 +814,32 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         }};
     }
 
+    if cmd == "reset" {
+        let result = match clap_parse!(crate::commands::reset::ResetArgs, cmd, &cmd_argv) {
+            Ok(args) => match crate::commands::reset::cmd_reset_non_destructive(
+                &db,
+                &args,
+                Some(&ctx),
+                is_inside_ai,
+            ) {
+                // Preview and hooks-only reset keep the router DB alive and
+                // continue to the shared pending-message delivery boundary.
+                Some(result) => result,
+                // Destructive reset owns the database-file lifecycle. Transfer
+                // the sole handle and return without any post-reset DB access.
+                None => {
+                    return crate::commands::reset::cmd_reset_destructive(db, &args, Some(&ctx));
+                }
+            },
+            Err(e) => {
+                e.print().ok();
+                if e.use_stderr() { 1 } else { 0 }
+            }
+        };
+        deliver_pending_messages_after_command(&db, &ctx, has_json);
+        return result;
+    }
+
     let result = match cmd {
         // Messaging
         "send" => match clap_parse!(crate::commands::send::SendArgs, cmd, &cmd_argv) {
@@ -862,9 +902,6 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             &cmd_argv,
             |args| crate::commands::archive::cmd_archive(&db, &args, Some(&ctx))
         ),
-        "reset" => clap_dispatch!(crate::commands::reset::ResetArgs, cmd, &cmd_argv, |args| {
-            crate::commands::reset::cmd_reset(&db, &args, Some(&ctx))
-        }),
         "hooks" => clap_dispatch!(crate::commands::hooks::HooksArgs, cmd, &cmd_argv, |args| {
             crate::commands::hooks::cmd_hooks(&db, &args, Some(&ctx))
         }),
@@ -890,13 +927,7 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         }
     };
 
-    // Deliver pending messages AFTER command.
-    // Deliver pending messages AFTER command for hookless codex/adhoc instances.
-    // This appends unread hcom messages to the command's stdout — keep in mind
-    // when changing output contracts or adding machine-readable modes.
-    if let Some(output) = crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json) {
-        print!("{output}");
-    }
+    deliver_pending_messages_after_command(&db, &ctx, has_json);
 
     result
 }

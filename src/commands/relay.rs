@@ -240,7 +240,7 @@ fn relay_status(db: &HcomDb) -> i32 {
         println!("Queued:    up to date");
     }
 
-    // Last push
+    // Last broker-confirmed publish
     let last_push: f64 = db
         .kv_get("relay_last_push")
         .ok()
@@ -248,9 +248,9 @@ fn relay_status(db: &HcomDb) -> i32 {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
     if last_push > 0.0 {
-        println!("Last push: {}", format_time(last_push));
+        println!("Broker-confirmed: {}", format_time(last_push));
     } else {
-        println!("Last push: never");
+        println!("Broker-confirmed: never");
     }
 
     let own_device = crate::relay::read_device_uuid().unwrap_or_default();
@@ -623,7 +623,7 @@ fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
     }
 
     if restart_relay_worker_for_config_change() {
-        println!("\nConnected.");
+        println!("\nConnected to broker.");
     } else if crate::relay::worker::is_relay_worker_running() {
         println!("\nDaemon started (not yet ready). Run 'hcom relay status' to confirm.");
     } else {
@@ -738,7 +738,7 @@ fn relay_connect(db: &HcomDb, argv: &[String]) -> i32 {
     }
 
     if restart_relay_worker_for_config_change() {
-        println!("\nConnected.");
+        println!("\nConnected to broker.");
     } else if crate::relay::worker::is_relay_worker_running() {
         println!("\nDaemon started (not yet ready). Run 'hcom relay status' to confirm.");
     } else {

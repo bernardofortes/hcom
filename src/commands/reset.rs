@@ -7,7 +7,7 @@
 //!   hcom reset all          Stop all + clear db + remove hooks + reset config
 
 use crate::db::HcomDb;
-use crate::shared::{CommandContext, is_inside_ai_tool};
+use crate::shared::CommandContext;
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResetTarget {
@@ -23,30 +23,80 @@ pub struct ResetArgs {
     pub target: Option<ResetTarget>,
 }
 
-pub fn cmd_reset(db: &HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) -> i32 {
+/// Handle reset modes that do not replace the database files while borrowing
+/// the router-owned handle. `Some` means the command completed and the router
+/// may still deliver pending messages through that handle. `None` transfers
+/// responsibility to [`cmd_reset_destructive`], which consumes the handle.
+pub fn cmd_reset_non_destructive(
+    db: &HcomDb,
+    args: &ResetArgs,
+    ctx: Option<&CommandContext>,
+    is_inside_ai: bool,
+) -> Option<i32> {
     let target = args.target;
 
     // Confirmation gate: inside AI tools, require --go
-    if is_inside_ai_tool() && !ctx.map(|c| c.go).unwrap_or(false) {
+    if is_inside_ai && !ctx.map(|c| c.go).unwrap_or(false) {
         super::reset_preview::print_reset_preview(target, db);
-        return 0;
+        return Some(0);
     }
-
-    let mut exit_codes = Vec::new();
 
     // hooks: remove hooks from all locations
     if target == Some(ResetTarget::Hooks) {
-        return super::hooks::cmd_hooks_remove(&["all".to_string()]);
+        return Some(super::hooks::cmd_hooks_remove(&["all".to_string()]));
     }
+
+    None
+}
+
+/// Archive and replace the database after the router transfers its sole
+/// in-process handle here. Preview and hooks-only modes must be handled by
+/// [`cmd_reset_non_destructive`] before this function is called.
+pub fn cmd_reset_destructive(db: HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) -> i32 {
+    let target = args.target;
+    let mut exit_codes = Vec::new();
+
+    // Stopping each instance normally spawns an asynchronous relay-push child.
+    // Keep those children from reopening SQLite while this command archives and
+    // replaces the database. The reset event is pushed once after the new DB is
+    // ready below.
+    let relay_push_suppression = crate::relay::suppress_background_pushes();
 
     // Stop all instances before clearing database
     let stop_args = crate::commands::stop::StopArgs {
         targets: vec!["all".into()],
     };
-    exit_codes.push(crate::commands::stop::cmd_stop(db, &stop_args, ctx));
+    let stop_exit = crate::commands::stop::cmd_stop(&db, &stop_args, ctx);
+    if stop_exit != 0 {
+        return stop_exit;
+    }
+    exit_codes.push(stop_exit);
 
     // Stop relay daemon if running before clear
-    let _ = crate::commands::daemon::daemon_stop();
+    let relay_pid = crate::relay::worker::relay_worker_pid();
+    let daemon_exit = crate::commands::daemon::daemon_stop();
+    if daemon_exit != 0 {
+        return daemon_exit;
+    }
+    if let Some(pid) = relay_pid {
+        for _ in 0..50 {
+            if !crate::pidtrack::is_alive(pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if crate::pidtrack::is_alive(pid) {
+            eprintln!(
+                "Error: relay daemon PID {pid} still owns runtime state; database reset was not started"
+            );
+            return 1;
+        }
+    }
+
+    // The router transfers its sole in-process database owner into this
+    // command. Release it before Windows file lifecycle operations; keeping
+    // this handle alive pins hcom.db and its WAL/SHM sidecars on Windows.
+    drop(db);
 
     // Clean temp files
     super::reset_ops::clean_temp_files();
@@ -55,7 +105,7 @@ pub fn cmd_reset(db: &HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) ->
     let archive_exit =
         super::reset_ops::print_archive_result(super::reset_ops::archive_and_clear_db());
     if archive_exit != 0 {
-        exit_codes.push(archive_exit);
+        return archive_exit;
     }
 
     // For reset all: clear pidtrack before recovery can trigger
@@ -68,6 +118,7 @@ pub fn cmd_reset(db: &HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) ->
 
     // Respawn relay worker (was stopped above) and push reset event to remote devices.
     // ensure_worker re-reads config, so this is a no-op when relay is not configured.
+    drop(relay_push_suppression);
     crate::relay::worker::ensure_worker(false);
     crate::relay::trigger_push();
 

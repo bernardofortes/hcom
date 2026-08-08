@@ -1,20 +1,49 @@
 //! Push loop — build state snapshot and events, publish via MQTT.
 //!
-//! Batches up to 100 events per publish with a 10s drain budget.
-//! Tracks progress via KV cursor `relay_last_push_id`.
+//! Batches up to 100 events per publish within the complete MQTT packet ceiling.
+//! Tracks the broker-confirmed cursor via KV key `relay_last_push_id`.
 
-use rumqttc::v5::Client;
 use rumqttc::v5::mqttbytes::QoS;
+use rumqttc::v5::mqttbytes::v5::Publish;
+use serde::Serialize;
 use serde_json::{Value, json};
-use std::time::Instant;
 
 use crate::db::HcomDb;
 use crate::log;
 
 use super::crypto;
-use super::{device_short_id_for_db, safe_kv_get, safe_kv_set, set_relay_status, state_topic};
+use super::{
+    MAX_RELAY_PACKET_BYTES, device_short_id_for_db, safe_kv_get, safe_kv_set, set_relay_status,
+    state_topic,
+};
 
 const RETAINED_EVENT_TAIL: i64 = 50;
+const MAX_NEW_EVENTS_PER_PACKET: usize = 100;
+
+#[derive(Debug)]
+struct EventRow {
+    id: i64,
+    value: Value,
+}
+
+/// A complete relay-state publication ready to enqueue. The cursor metadata is
+/// intentionally carried beside the bytes and is committed only after the
+/// event loop observes the matching successful PUBACK.
+#[derive(Debug)]
+pub(crate) struct PreparedPush {
+    pub topic: String,
+    pub sealed: Vec<u8>,
+    pub packet_bytes: usize,
+    pub event_count: usize,
+    pub max_event_id: i64,
+    pub has_more: bool,
+}
+
+#[derive(Serialize)]
+struct PushPayload<'a> {
+    state: &'a Value,
+    events: &'a [Value],
+}
 
 /// Build current instance state snapshot for publishing.
 /// Only includes local instances (no origin_device_id).
@@ -109,132 +138,216 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
     })
 }
 
-/// Build push payload: state + events, returning (state, events, max_event_id, has_more).
-/// Fetches 101 rows, sends first 100 — has_more=true if 101st exists.
-pub fn build_push_payload(db: &HcomDb, device_uuid: &str) -> (Value, Vec<Value>, i64, bool) {
-    let state = build_state(db, device_uuid);
+fn load_event_rows(
+    db: &HcomDb,
+    comparison: &str,
+    cursor: i64,
+    order: &str,
+    limit: usize,
+) -> Result<Vec<EventRow>, String> {
+    let sql = format!(
+        "SELECT id, timestamp, type, instance, data FROM events
+         WHERE id {comparison} ?1 AND instance NOT LIKE '%:%'
+         AND instance != '_device'
+         AND json_extract(data, '$._relay') IS NULL
+         ORDER BY id {order} LIMIT ?2"
+    );
+    let mut stmt = db
+        .conn()
+        .prepare(&sql)
+        .map_err(|e| format!("event query: {e}"))?;
+    let rows = stmt
+        .query_map(rusqlite::params![cursor, limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|e| format!("event query: {e}"))?;
 
+    rows.map(|row| {
+        let (id, ts, event_type, instance, data_str) =
+            row.map_err(|e| format!("event row: {e}"))?;
+        let data: Value = serde_json::from_str(&data_str)
+            .map_err(|e| format!("event {id} contains invalid JSON: {e}"))?;
+        Ok(EventRow {
+            id,
+            value: json!({
+                "id": id,
+                "ts": ts,
+                "type": event_type,
+                "instance": instance,
+                "data": data,
+            }),
+        })
+    })
+    .collect()
+}
+
+fn serialize_payload(state: &Value, events: &[Value]) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&PushPayload { state, events }).map_err(|e| format!("json: {e}"))
+}
+
+fn complete_publish_packet_size(topic: &str, sealed_payload_len: usize) -> usize {
+    let mut publish = Publish::new(
+        topic,
+        QoS::AtLeastOnce,
+        vec![0_u8; sealed_payload_len],
+        None,
+    );
+    publish.retain = true;
+    // QoS 1 always carries a two-byte packet identifier. A non-zero stand-in
+    // makes Publish::size account for the same field rumqttc adds at enqueue.
+    publish.pkid = 1;
+    publish.size()
+}
+
+fn candidate_packet_size(topic: &str, state: &Value, events: &[Value]) -> Result<usize, String> {
+    let plaintext_len = serialize_payload(state, events)?.len();
+    let sealed_len = plaintext_len + crypto::HEADER_LEN + crypto::TAG_LEN;
+    Ok(complete_publish_packet_size(topic, sealed_len))
+}
+
+pub(crate) fn ensure_complete_publish_packet_size(
+    topic: &str,
+    sealed_payload: &[u8],
+) -> Result<usize, String> {
+    let packet_bytes = complete_publish_packet_size(topic, sealed_payload.len());
+    if packet_bytes > MAX_RELAY_PACKET_BYTES {
+        return Err(format!(
+            "relay state PUBLISH packet is {packet_bytes} bytes; compatibility limit is {MAX_RELAY_PACKET_BYTES} bytes"
+        ));
+    }
+    Ok(packet_bytes)
+}
+
+/// Build one complete, packet-budgeted state publication. New events are always
+/// selected in ID order and never skipped; once the backlog is empty, a later
+/// retained snapshot includes as much confirmed tail context as fits. If the
+/// first new event cannot fit with the state snapshot, preparation fails loudly
+/// and leaves the durable cursor untouched.
+pub(crate) fn prepare_push(
+    db: &HcomDb,
+    relay_id: &str,
+    device_uuid: &str,
+    psk: &[u8; 32],
+) -> Result<PreparedPush, String> {
+    let state = build_state(db, device_uuid);
+    let topic = state_topic(relay_id, device_uuid);
     let last_push_id: i64 = safe_kv_get(db, "relay_last_push_id")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let tail_start_id = last_push_id.saturating_sub(RETAINED_EVENT_TAIL);
+    let mut retained =
+        load_event_rows(db, "<=", last_push_id, "DESC", RETAINED_EVENT_TAIL as usize)?;
+    retained.reverse();
+    let new_rows = load_event_rows(db, ">", last_push_id, "ASC", MAX_NEW_EVENTS_PER_PACKET + 1)?;
+    let new_limit = new_rows.len().min(MAX_NEW_EVENTS_PER_PACKET);
 
-    let rows: Vec<(i64, String, String, String, String)> = db
-        .conn()
-        .prepare(
-            "SELECT id, timestamp, type, instance, data FROM events
-             WHERE id > ? AND instance NOT LIKE '%:%'
-             AND instance != '_device'
-             AND json_extract(data, '$._relay') IS NULL
-             ORDER BY id LIMIT 101",
-        )
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map(rusqlite::params![tail_start_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
+    let state_only_size = candidate_packet_size(&topic, &state, &[])?;
+    if state_only_size > MAX_RELAY_PACKET_BYTES {
+        return Err(format!(
+            "relay state snapshot requires a {state_only_size}-byte MQTT PUBLISH packet; compatibility limit is {MAX_RELAY_PACKET_BYTES} bytes"
+        ));
+    }
 
-    let has_more = rows.len() > 100;
-    let send_rows = &rows[..rows.len().min(100)];
+    // During backlog drain, spend the packet budget only on ordered,
+    // unconfirmed events. Repacking the already-confirmed tail beside every
+    // new unit turns a two-packet backlog into a burst of near-limit packets.
+    // Once no new events remain, the periodic retained snapshot rebuilds as
+    // much of the confirmed tail as fits for late subscribers.
+    let mut events: Vec<Value> = if new_rows.is_empty() {
+        retained.iter().map(|row| row.value.clone()).collect()
+    } else {
+        Vec::new()
+    };
 
-    let mut events = Vec::new();
-    let mut max_id = last_push_id;
-
-    for (id, ts, event_type, instance, data_str) in send_rows {
-        let data: Value = serde_json::from_str(data_str).unwrap_or(json!({}));
-        events.push(json!({
-            "id": id,
-            "ts": ts,
-            "type": event_type,
-            "instance": instance,
-            "data": data,
-        }));
-        if *id > last_push_id {
-            max_id = max_id.max(*id);
+    if let Some(first_new) = new_rows.first() {
+        let packet_bytes =
+            candidate_packet_size(&topic, &state, std::slice::from_ref(&first_new.value))?;
+        if packet_bytes > MAX_RELAY_PACKET_BYTES {
+            return Err(format!(
+                "relay event {} requires a {packet_bytes}-byte MQTT PUBLISH packet with the current state snapshot; compatibility limit is {MAX_RELAY_PACKET_BYTES} bytes; cursor remains {last_push_id}",
+                first_new.id
+            ));
+        }
+    } else {
+        while candidate_packet_size(&topic, &state, &events)? > MAX_RELAY_PACKET_BYTES {
+            events.remove(0);
         }
     }
 
-    (state, events, max_id, has_more)
-}
+    let mut selected_new = 0;
+    for row in new_rows.iter().take(new_limit) {
+        events.push(row.value.clone());
+        if candidate_packet_size(&topic, &state, &events)? > MAX_RELAY_PACKET_BYTES {
+            events.pop();
+            break;
+        }
+        selected_new += 1;
+    }
 
-/// Push state and events via MQTT. Returns (success, has_more).
-/// `is_worker` should be true when called from the daemon relay thread.
-/// `mqtt_connected` indicates whether the MQTT connection is known to be live.
-/// When false, events are still published (rumqttc may buffer and deliver on
-/// reconnect) but the cursor is NOT advanced — events will be re-sent on the
-/// next push after the connection recovers, preventing silent event loss.
-pub fn push(
-    db: &HcomDb,
-    client: &Client,
-    relay_id: &str,
-    device_uuid: &str,
-    psk: &[u8; 32],
-    is_worker: bool,
-    mqtt_connected: bool,
-) -> Result<(bool, bool), String> {
-    let (state, events, max_id, has_more) = build_push_payload(db, device_uuid);
-
-    let payload = json!({
-        "state": state,
-        "events": events,
-    });
-    let payload_bytes = serde_json::to_vec(&payload).map_err(|e| format!("json: {}", e))?;
-
-    let topic = state_topic(relay_id, device_uuid);
+    let max_event_id = if selected_new == 0 {
+        last_push_id
+    } else {
+        new_rows[selected_new - 1].id
+    };
+    let has_more = selected_new < new_limit || new_rows.len() > MAX_NEW_EVENTS_PER_PACKET;
+    let payload_bytes = serialize_payload(&state, &events)?;
     let now_secs = crate::shared::time::now_epoch_f64() as u64;
     let sealed = crypto::seal(psk, relay_id, &topic, &payload_bytes, now_secs)
-        .map_err(|e| format!("seal: {}", e))?;
-    let payload_len = sealed.len();
+        .map_err(|e| format!("seal: {e}"))?;
+    let packet_bytes = ensure_complete_publish_packet_size(&topic, &sealed)?;
 
-    let t0 = Instant::now();
+    Ok(PreparedPush {
+        topic,
+        sealed,
+        packet_bytes,
+        event_count: events.len(),
+        max_event_id,
+        has_more,
+    })
+}
 
-    // Enqueue into rumqttc's internal channel. With QoS::AtLeastOnce rumqttc
-    // handles retransmission if the connection is live. When disconnected,
-    // the message may sit in the internal buffer and be delivered on reconnect,
-    // but we cannot guarantee it — so we only advance the cursor when
-    // mqtt_connected is true.
-    client
-        .publish(&topic, QoS::AtLeastOnce, true, sealed)
-        .map_err(|e| format!("publish: {}", e))?;
-
-    let publish_ms = t0.elapsed().as_millis();
-
-    if mqtt_connected {
-        // Connection is live — advance cursor so these events aren't re-sent.
-        let now = crate::shared::time::now_epoch_f64();
-        safe_kv_set(db, "relay_last_push", Some(&now.to_string()));
-        safe_kv_set(db, "relay_last_push_id", Some(&max_id.to_string()));
-        safe_kv_set(db, "relay_last_sync", Some(&now.to_string()));
-        set_relay_status(db, "ok", None, is_worker);
-    }
-    // When disconnected: publish is best-effort (rumqttc may buffer), but
-    // cursor stays put so events are re-sent after reconnect.
-
+pub(crate) fn record_queued(db: &HcomDb, prepared: &PreparedPush) {
+    set_relay_status(db, "queued", None, true);
     log::log_with_fields(
         "INFO",
         "relay",
-        "relay.push",
+        "relay.push_queued",
         "",
         &[
-            ("events", &events.len().to_string()),
-            ("publish_ms", &publish_ms.to_string()),
-            ("payload_bytes", &payload_len.to_string()),
+            ("events", &prepared.event_count.to_string()),
+            ("packet_bytes", &prepared.packet_bytes.to_string()),
+            ("cursor_candidate", &prepared.max_event_id.to_string()),
         ],
     );
+}
 
-    Ok((true, has_more))
+pub(crate) fn commit_broker_confirmed(db: &HcomDb, prepared: &PreparedPush) {
+    let now = crate::shared::time::now_epoch_f64();
+    safe_kv_set(db, "relay_last_push", Some(&now.to_string()));
+    safe_kv_set(
+        db,
+        "relay_last_push_id",
+        Some(&prepared.max_event_id.to_string()),
+    );
+    safe_kv_set(db, "relay_last_sync", Some(&now.to_string()));
+    set_relay_status(db, "ok", None, true);
+    log::log_with_fields(
+        "INFO",
+        "relay",
+        "relay.push_broker_confirmed",
+        "",
+        &[
+            ("events", &prepared.event_count.to_string()),
+            ("packet_bytes", &prepared.packet_bytes.to_string()),
+            ("cursor", &prepared.max_event_id.to_string()),
+        ],
+    );
 }
 
 /// Parse ISO 8601 timestamp to Unix epoch seconds.
@@ -250,6 +363,15 @@ mod tests {
     use super::*;
     use crate::db::HcomDb;
     use serde_json::json;
+
+    const TEST_PSK: [u8; 32] = [0x41; 32];
+
+    fn decoded_events(prepared: &PreparedPush) -> Vec<Value> {
+        let plaintext =
+            crypto::open(&TEST_PSK, "relay-test", &prepared.topic, &prepared.sealed).unwrap();
+        let payload: Value = serde_json::from_slice(&plaintext).unwrap();
+        payload["events"].as_array().unwrap().clone()
+    }
 
     #[test]
     fn test_parse_iso_timestamp_to_epoch() {
@@ -267,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn build_push_payload_includes_recent_retained_tail() {
+    fn prepared_push_includes_recent_retained_tail() {
         let dir = tempfile::tempdir().unwrap();
         let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
 
@@ -279,10 +401,11 @@ mod tests {
             .unwrap();
         safe_kv_set(&db, "relay_last_push_id", Some(&recent_id.to_string()));
 
-        let (_state, events, max_id, has_more) = build_push_payload(&db, "device-a");
+        let prepared = prepare_push(&db, "relay-test", "device-a", &TEST_PSK).unwrap();
+        let events = decoded_events(&prepared);
 
-        assert!(!has_more);
-        assert_eq!(max_id, recent_id);
+        assert!(!prepared.has_more);
+        assert_eq!(prepared.max_event_id, recent_id);
         assert!(
             events
                 .iter()
@@ -294,5 +417,85 @@ mod tests {
                 .iter()
                 .any(|event| event["id"].as_i64() == Some(recent_id))
         );
+    }
+
+    #[test]
+    fn complete_packet_limit_includes_mqtt_framing() {
+        let topic = "relay-test/device-a";
+        let sealed = vec![0_u8; MAX_RELAY_PACKET_BYTES - 1];
+
+        assert!(sealed.len() < MAX_RELAY_PACKET_BYTES);
+        let err = ensure_complete_publish_packet_size(topic, &sealed).unwrap_err();
+        assert!(err.contains("PUBLISH packet"));
+        assert!(err.contains(&MAX_RELAY_PACKET_BYTES.to_string()));
+    }
+
+    #[test]
+    fn adaptive_batches_drain_large_backlog_without_omitting_new_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let mut expected = Vec::new();
+        for index in 0..30 {
+            expected.push(
+                db.log_event(
+                    "message",
+                    "sender",
+                    &json!({"index": index, "text": "x".repeat(9_000)}),
+                )
+                .unwrap(),
+            );
+        }
+
+        let mut observed = Vec::new();
+        let mut packet_count = 0;
+        loop {
+            let cursor_before: i64 = safe_kv_get(&db, "relay_last_push_id")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let prepared = prepare_push(&db, "relay-test", "device-a", &TEST_PSK).unwrap();
+            packet_count += 1;
+            assert!(prepared.packet_bytes <= MAX_RELAY_PACKET_BYTES);
+            for event in decoded_events(&prepared) {
+                let id = event["id"].as_i64().unwrap();
+                if id > cursor_before {
+                    observed.push(id);
+                }
+            }
+            let has_more = prepared.has_more;
+            commit_broker_confirmed(&db, &prepared);
+            if !has_more {
+                break;
+            }
+        }
+
+        assert_eq!(
+            packet_count, 3,
+            "confirmed tail must not be repacked beside every new event"
+        );
+        assert_eq!(observed, expected);
+        assert_eq!(
+            safe_kv_get(&db, "relay_last_push_id").as_deref(),
+            expected.last().map(ToString::to_string).as_deref()
+        );
+        assert_eq!(safe_kv_get(&db, "relay_status").as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn single_oversized_event_fails_without_advancing_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let event_id = db
+            .log_event(
+                "message",
+                "sender",
+                &json!({"text": "x".repeat(MAX_RELAY_PACKET_BYTES + 8_192)}),
+            )
+            .unwrap();
+
+        let err = prepare_push(&db, "relay-test", "device-a", &TEST_PSK).unwrap_err();
+        assert!(err.contains(&format!("relay event {event_id}")));
+        assert!(err.contains("cursor remains 0"));
+        assert!(safe_kv_get(&db, "relay_last_push_id").is_none());
+        assert!(safe_kv_get(&db, "relay_last_push").is_none());
     }
 }

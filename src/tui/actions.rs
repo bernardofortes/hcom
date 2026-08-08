@@ -134,7 +134,7 @@ impl App {
         match result.op {
             RpcOp::Send { .. } => match result.result {
                 Ok(resp) if resp.ok() => {
-                    self.ui.flash = Some(Flash::new("Message sent".into(), Theme::flash_ok()));
+                    self.ui.flash = Some(Flash::new("Message queued".into(), Theme::flash_ok()));
                     self.reload_data();
                 }
                 other => self.ui.flash = Some(rpc_error_flash("Send failed", other)),
@@ -456,6 +456,23 @@ mod tests {
 
         assert!(!app.ui.selected.contains("nova"));
         assert!(flash_text(&app).contains("Killed nova"));
+    }
+
+    #[test]
+    fn apply_rpc_result_send_success_reports_queued_not_peer_delivery() {
+        let mut app = test_app();
+
+        app.apply_rpc_result(RpcResult {
+            op: RpcOp::Send {
+                recipients: vec!["nova".into()],
+                body: "hello".into(),
+                intent: None,
+                reply_to: None,
+            },
+            result: Ok(ok_response()),
+        });
+
+        assert_eq!(flash_text(&app), "Message queued");
     }
 
     #[test]

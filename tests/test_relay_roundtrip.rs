@@ -347,6 +347,38 @@ fn read_device_uuid(hcom_dir: &str) -> Option<String> {
     })
 }
 
+fn set_relay_enabled_in_temp_config(hcom_dir: &str, enabled: bool) {
+    let path = Path::new(hcom_dir).join("config.toml");
+    let content = fs::read_to_string(&path).expect("read temporary relay config");
+    let from = format!("enabled = {}", !enabled);
+    let to = format!("enabled = {enabled}");
+    assert!(
+        content.contains(&from),
+        "temporary relay config did not contain `{from}`: {content}"
+    );
+    fs::write(&path, content.replacen(&from, &to, 1)).expect("write temporary relay config");
+}
+
+fn event_texts(hcom_dir: &str, limit: usize) -> Vec<String> {
+    let out = hcom_with_dir(&format!("events --last {limit}"), hcom_dir);
+    assert!(
+        out.status.success(),
+        "events failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .filter_map(|event| {
+            let mut data = event["data"].clone();
+            if let Some(encoded) = data.as_str() {
+                data = serde_json::from_str(encoded).ok()?;
+            }
+            data["text"].as_str().map(str::to_string)
+        })
+        .collect()
+}
+
 fn parse_names(output: &str) -> Vec<String> {
     output
         .lines()
@@ -1225,6 +1257,89 @@ fn test_relay_roundtrip() {
         relay_marker["short"]
     );
     logln!(log, "  OK: _relay.short = {short_a}");
+
+    // ── Phase 4b: packet-budgeted backlog drain ────────────────
+    // Stop only A's worker, then disable its temp config directly so CLI sends
+    // accumulate locally without broadcasting relay_off to B. Re-enable after
+    // the backlog exceeds the former 211,174-byte failure size; B stays online
+    // and must observe every marker in serial MQTT publications.
+    logln!(
+        log,
+        "\n[Phase 4b] Device A: accumulating and draining >211 KiB backlog..."
+    );
+    check("A", "relay daemon stop", &path_a);
+    set_relay_enabled_in_temp_config(&path_a, false);
+
+    let load_run = &uuid::Uuid::new_v4().to_string()[..8];
+    let mut load_markers = Vec::new();
+    let mut aggregate_text_bytes = 0;
+    for index in 0..28 {
+        let marker = format!("relay-load-{load_run}-{index:02}");
+        let body = format!("{marker}:{}", "x".repeat(8_000));
+        aggregate_text_bytes += body.len();
+        let out = hcom_with_dir(&format!("send --from relayload -- {body}"), &path_a);
+        assert!(
+            out.status.success(),
+            "backlog send {index} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        load_markers.push(marker);
+    }
+    let terminal_marker = format!("relay-load-{load_run}-terminal");
+    let out = hcom_with_dir(
+        &format!("send --from relayload -- {terminal_marker}"),
+        &path_a,
+    );
+    assert!(
+        out.status.success(),
+        "terminal marker send failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    aggregate_text_bytes += terminal_marker.len();
+    load_markers.push(terminal_marker.clone());
+    assert!(aggregate_text_bytes > 211_174);
+
+    set_relay_enabled_in_temp_config(&path_a, true);
+    check("A", "relay daemon start", &path_a);
+
+    let received_texts = poll_until(
+        || {
+            let texts = event_texts(&path_b, 200);
+            texts
+                .iter()
+                .any(|text| text.contains(&terminal_marker))
+                .then_some(texts)
+        },
+        "Device B sees terminal marker after packet-budgeted backlog drain",
+        Duration::from_secs(90),
+        Duration::from_secs(1),
+    );
+    for marker in &load_markers {
+        assert!(
+            received_texts.iter().any(|text| text.contains(marker)),
+            "Device B omitted backlog marker {marker}"
+        );
+    }
+    let status_after_load = poll_until(
+        || {
+            let out = hcom_with_dir("relay status", &path_a);
+            if !out.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            stdout.contains("Queued:    up to date").then_some(stdout)
+        },
+        "Device A cursor advances after the terminal batch PUBACK",
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    assert!(status_after_load.contains("Broker-confirmed:"));
+    logln!(
+        log,
+        "  OK: {} individually fitting events / {} text bytes broker-confirmed; terminal marker observed",
+        load_markers.len(),
+        aggregate_text_bytes
+    );
 
     // ── Phase 5: Device A sees Device B as remote ────────────────
     logln!(

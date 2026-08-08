@@ -91,6 +91,148 @@ fn events_empty_in_fresh_dir() {
 }
 
 #[test]
+fn reset_archives_populated_database_and_bootstraps_fresh_state() {
+    let h = Hcom::new();
+    h.start();
+
+    let (code, stdout, stderr) = h.run(["reset"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("Archived to"), "stdout={stdout}");
+    assert!(stdout.contains("Started fresh HCOM conversation"));
+
+    let archive_root = h.path().join("archive");
+    let archived_database = std::fs::read_dir(&archive_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("hcom.db"))
+        .find(|path| path.is_file());
+    assert!(archived_database.is_some(), "archive_root={archive_root:?}");
+
+    let (list_code, list_stdout, list_stderr) = h.run(["list", "--json"]);
+    assert_eq!(list_code, 0, "stdout={list_stdout} stderr={list_stderr}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&list_stdout).unwrap(),
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn reset_hooks_removes_isolated_hooks_preserves_db_and_delivers_pending() {
+    let h = Hcom::new();
+    let recipient_pid = "reset-hooks-recipient";
+    let recipient = h.start_with_process_id(recipient_pid);
+    let sender = h.start();
+
+    let (add_code, add_stdout, add_stderr) = h.run(["hooks", "add", "claude"]);
+    assert_eq!(add_code, 0, "stdout={add_stdout} stderr={add_stderr}");
+    assert!(add_stdout.contains("Added Claude hooks"), "{add_stdout}");
+
+    let pending_text = "pending message survives reset hooks";
+    let target = format!("@{recipient}");
+    let (send_code, send_stdout, send_stderr) =
+        h.run(["send", &target, "--name", &sender, "--", pending_text]);
+    assert_eq!(send_code, 0, "stdout={send_stdout} stderr={send_stderr}");
+
+    let (reset_code, reset_stdout, reset_stderr) =
+        h.run_as_process(recipient_pid, ["reset", "hooks"]);
+    assert_eq!(reset_code, 0, "stdout={reset_stdout} stderr={reset_stderr}");
+    assert!(
+        reset_stdout.contains("Removed Claude hooks"),
+        "{reset_stdout}"
+    );
+    assert!(
+        reset_stdout.contains(pending_text),
+        "reset hooks skipped pending-message delivery: {reset_stdout}"
+    );
+
+    let (hooks_code, hooks_stdout, hooks_stderr) = h.run(["hooks", "status"]);
+    assert_eq!(hooks_code, 0, "stdout={hooks_stdout} stderr={hooks_stderr}");
+    assert!(
+        hooks_stdout.contains("Claude:  not installed"),
+        "{hooks_stdout}"
+    );
+
+    let instances = h.list_json().expect("list after reset hooks");
+    assert!(
+        instances
+            .iter()
+            .any(|instance| instance["name"].as_str() == Some(&recipient)),
+        "reset hooks unexpectedly cleared the database: {instances:?}"
+    );
+}
+
+#[test]
+fn reset_all_preserves_full_reset_behavior_in_isolated_fixture() {
+    let h = Hcom::new();
+    h.start();
+
+    let (add_code, add_stdout, add_stderr) = h.run(["hooks", "add", "claude"]);
+    assert_eq!(add_code, 0, "stdout={add_stdout} stderr={add_stderr}");
+    assert!(add_stdout.contains("Added Claude hooks"), "{add_stdout}");
+
+    let custom_config = "[terminal]\ntitle_mode = \"name\"\n";
+    std::fs::write(h.path().join("config.toml"), custom_config).unwrap();
+    std::fs::write(h.path().join("config.env"), "RESET_ALL_TEST=1\n").unwrap();
+    let device_id = h.path().join(".tmp").join("device_id");
+    std::fs::create_dir_all(device_id.parent().unwrap()).unwrap();
+    std::fs::write(&device_id, "isolated-device-id").unwrap();
+
+    let (reset_code, reset_stdout, reset_stderr) = h.run(["reset", "all"]);
+    assert_eq!(reset_code, 0, "stdout={reset_stdout} stderr={reset_stderr}");
+    assert!(reset_stdout.contains("Archived to"), "{reset_stdout}");
+    assert!(
+        reset_stdout.contains("Config archived to"),
+        "{reset_stdout}"
+    );
+    // The existing post-reset relay trigger may asynchronously recreate the
+    // default config. The reset contract is that the custom config is gone,
+    // not that the default file can never reappear.
+    if let Ok(current_config) = std::fs::read_to_string(h.path().join("config.toml")) {
+        assert!(!current_config.contains("title_mode = \"name\""));
+    }
+    assert!(!h.path().join("config.env").exists());
+    assert!(!device_id.exists());
+
+    let config_archive = h.path().join("archive").join("config");
+    let archived_files: Vec<std::path::PathBuf> = std::fs::read_dir(&config_archive)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    let archived_config = archived_files
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("config.toml."))
+        })
+        .expect("custom config should be archived");
+    assert_eq!(
+        std::fs::read_to_string(archived_config).unwrap(),
+        custom_config
+    );
+    assert!(
+        archived_files.iter().any(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("env."))
+        }),
+        "archived files: {archived_files:?}"
+    );
+
+    let (hooks_code, hooks_stdout, hooks_stderr) = h.run(["hooks", "status"]);
+    assert_eq!(hooks_code, 0, "stdout={hooks_stdout} stderr={hooks_stderr}");
+    assert!(
+        hooks_stdout.contains("Claude:  not installed"),
+        "{hooks_stdout}"
+    );
+    assert!(
+        h.list_json().expect("list after reset all").is_empty(),
+        "reset all should bootstrap fresh state without instances"
+    );
+}
+
+#[test]
 fn send_without_identity_errors_with_hint() {
     let h = Hcom::new();
     let (code, _stdout, stderr) = h.run(["send", "@nobody", "--", "hi"]);
@@ -206,7 +348,7 @@ fn ai_tool_broadcast_to_many_requires_go_preview() {
     let go_stderr = String::from_utf8_lossy(&go_out.stderr);
     assert_eq!(go_code, 0, "stdout={go_stdout} stderr={go_stderr}");
     assert!(
-        go_stdout.contains("Sent to:") || go_stdout.contains("Sent to 4 agents"),
+        go_stdout.contains("Queued for:") || go_stdout.contains("Queued for 4 agents"),
         "stdout={go_stdout}"
     );
 }
@@ -227,6 +369,8 @@ fn start_send_events_roundtrip() {
         "hello there",
     ]);
     assert_eq!(c, 0, "stderr={stderr} stdout={stdout}");
+    assert!(stdout.contains("Queued for:"), "stdout={stdout}");
+    assert!(!stdout.contains("Sent to:"), "stdout={stdout}");
 
     let (c4, events_out, _) = h.run(["events", "--last", "10"]);
     assert_eq!(c4, 0);
