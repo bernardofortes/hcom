@@ -7,6 +7,33 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Build the TLS client configuration shared by broker probes and MQTT
+/// connections. Bundled roots keep public brokers portable, while native
+/// roots allow private brokers signed by a locally installed CA.
+pub(crate) fn relay_tls_client_config() -> rustls::ClientConfig {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let native_certs = rustls_native_certs::load_native_certs();
+    for cert in native_certs.certs {
+        let _ = root_store.add(cert);
+    }
+    if !native_certs.errors.is_empty() {
+        crate::log::log_warn(
+            "relay",
+            "relay.native_certs_partial",
+            &format!(
+                "failed to load {} native cert(s); continuing with bundled roots",
+                native_certs.errors.len()
+            ),
+        );
+    }
+
+    rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth()
+}
+
 /// Result of testing a single broker: (host, port, ping_ms or None on failure).
 pub type BrokerTestResult = (String, u16, Option<u64>);
 
@@ -27,14 +54,10 @@ pub fn ping_broker(host: &str, port: u16, use_tls: bool) -> Option<u64> {
             .set_write_timeout(Some(Duration::from_secs(5)))
             .ok()?;
 
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
         let server_name: rustls::pki_types::ServerName<'static> =
             host.to_string().try_into().ok()?;
-        let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name).ok()?;
+        let mut conn =
+            rustls::ClientConnection::new(Arc::new(relay_tls_client_config()), server_name).ok()?;
 
         // Drive TLS handshake via complete_io (handles read/write round-trips).
         // Stops after handshake — the read timeout prevents blocking on post-handshake

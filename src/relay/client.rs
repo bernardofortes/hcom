@@ -9,8 +9,6 @@ use rumqttc::TlsConfiguration;
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::mqttbytes::v5::{Packet, PubAck, PubAckReason};
 use rumqttc::v5::{Client, Connection, Event, MqttOptions};
-use rustls::RootCertStore;
-use rustls_native_certs::load_native_certs;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,32 +28,7 @@ use super::{
 /// compatibility) with native system certs (for private broker support).
 /// This ensures public brokers work everywhere while preserving user-installed CA support.
 fn relay_tls_config() -> TlsConfiguration {
-    let mut root_store = RootCertStore::empty();
-
-    // Add webpki-roots as the base — fixes Android/Termux where rustls-native-certs fails
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    // Also add native system certs if available, for private broker support
-    let native_certs = load_native_certs();
-    for cert in native_certs.certs {
-        let _ = root_store.add(cert);
-    }
-    if !native_certs.errors.is_empty() {
-        log::log_warn(
-            "relay",
-            "relay.native_certs_partial",
-            &format!(
-                "failed to load {} native cert(s); continuing with bundled roots",
-                native_certs.errors.len()
-            ),
-        );
-    }
-
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    TlsConfiguration::Rustls(Arc::new(tls_config))
+    TlsConfiguration::Rustls(Arc::new(super::broker::relay_tls_client_config()))
 }
 
 /// Commands sent from the main thread to the relay event loop.
