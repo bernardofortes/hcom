@@ -21,6 +21,27 @@ pub use worker::observe_pid_file;
 use crate::config::HcomConfig;
 use crate::db::HcomDb;
 use crate::instance_names;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static BACKGROUND_PUSH_SUPPRESSIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Process-local guard used while a command owns the database-file lifecycle.
+///
+/// Some mutations normally launch a fire-and-forget `hcom relay push` child.
+/// A destructive reset must not do that while stopping instances: on Windows
+/// the child can open SQLite between the parent's final close and file removal.
+pub(crate) struct BackgroundPushSuppression;
+
+impl Drop for BackgroundPushSuppression {
+    fn drop(&mut self) {
+        BACKGROUND_PUSH_SUPPRESSIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn suppress_background_pushes() -> BackgroundPushSuppression {
+    BACKGROUND_PUSH_SUPPRESSIONS.fetch_add(1, Ordering::Relaxed);
+    BackgroundPushSuppression
+}
 
 /// Public MQTT brokers (TLS, port 8883/8886). Tried in order during initial setup;
 /// first success gets pinned to config. Append-only (never insert/reorder) to preserve
@@ -702,7 +723,9 @@ pub fn notify_relay_daemon() -> bool {
 /// the test's temporary environment and fall back to the developer's `~/.hcom`.
 pub fn spawn_background_push() {
     #[cfg(not(test))]
-    spawn_background_push_with(&crate::runtime_env::get_hcom_prefix());
+    if BACKGROUND_PUSH_SUPPRESSIONS.load(Ordering::Relaxed) == 0 {
+        spawn_background_push_with(&crate::runtime_env::get_hcom_prefix());
+    }
 }
 
 // Callers: `spawn_background_push` under `not(test)`, and the unix-only

@@ -56,6 +56,12 @@ pub fn cmd_reset_destructive(db: HcomDb, args: &ResetArgs, ctx: Option<&CommandC
     let target = args.target;
     let mut exit_codes = Vec::new();
 
+    // Stopping each instance normally spawns an asynchronous relay-push child.
+    // Keep those children from reopening SQLite while this command archives and
+    // replaces the database. The reset event is pushed once after the new DB is
+    // ready below.
+    let relay_push_suppression = crate::relay::suppress_background_pushes();
+
     // Stop all instances before clearing database
     let stop_args = crate::commands::stop::StopArgs {
         targets: vec!["all".into()],
@@ -112,6 +118,7 @@ pub fn cmd_reset_destructive(db: HcomDb, args: &ResetArgs, ctx: Option<&CommandC
 
     // Respawn relay worker (was stopped above) and push reset event to remote devices.
     // ensure_worker re-reads config, so this is a no-op when relay is not configured.
+    drop(relay_push_suppression);
     crate::relay::worker::ensure_worker(false);
     crate::relay::trigger_push();
 

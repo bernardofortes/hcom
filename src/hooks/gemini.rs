@@ -2088,15 +2088,9 @@ mod tests {
     #[test]
     #[serial]
     fn test_setup_and_verify_gemini_hooks() {
-        let dir = tempfile::tempdir().unwrap();
-        let hcom_dir = dir.path().join(".hcom");
-        std::fs::create_dir_all(&hcom_dir).unwrap();
+        let (dir, _hcom_dir, _test_home, _guard) = isolated_test_env();
         let settings_dir = dir.path().join(".gemini");
         std::fs::create_dir_all(&settings_dir).unwrap();
-
-        // Redirect paths via HCOM_DIR
-        let saved = std::env::var("HCOM_DIR").ok();
-        unsafe { std::env::set_var("HCOM_DIR", &hcom_dir) };
 
         let success = setup_gemini_hooks(true);
         assert!(success, "setup should succeed");
@@ -2125,13 +2119,6 @@ mod tests {
         assert!(remove_ok);
         let verify_after_remove = verify_hooks_at(&settings_path, false).is_ok();
         assert!(!verify_after_remove, "verify should fail after remove");
-
-        // Restore
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("HCOM_DIR", v) };
-        } else {
-            unsafe { std::env::remove_var("HCOM_DIR") };
-        }
     }
 
     use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};
