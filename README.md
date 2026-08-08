@@ -16,6 +16,13 @@ https://github.com/user-attachments/assets/1ce23ed9-f529-4be0-8124-816aa4c2fd43
 
 ---
 
+## Development in this fork
+
+Maintained changes follow [`ARCHITECTURE.md`](ARCHITECTURE.md) and approved
+BBF packages under [`docs/scopes/`](docs/scopes/).
+
+---
+
 ## Install
 
 ```bash
