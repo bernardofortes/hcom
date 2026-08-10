@@ -412,6 +412,8 @@ impl HcomDb {
         let mut event_id = None;
 
         let won = self.with_immediate_transaction(|tx| {
+            crate::relay::push::validate_local_relay_event(&timestamp, "life", name, event_data)?;
+
             let deleted = tx.execute(
                 "DELETE FROM instances
                  WHERE name = ? AND created_at = ?
@@ -926,6 +928,44 @@ mod tests {
     fn reopen_broken_schema(db_path: &std::path::Path) -> HcomDb {
         // Use open_raw here: open_at would repair the table we deliberately dropped.
         HcomDb::open_raw(db_path).unwrap()
+    }
+
+    #[test]
+    fn finalize_stop_event_admission_rolls_back_before_instance_deletion() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, agent_id, tool, status, created_at)
+                 VALUES ('luna', 'session-1', 'agent-1', 'claude', 'active', 1)",
+                [],
+            )
+            .unwrap();
+        let event = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {"transcript": "x".repeat(crate::relay::MAX_RELAY_EVENT_BYTES)}
+        });
+
+        let error = db
+            .finalize_instance_stop("luna", 1.0, Some("session-1"), Some("agent-1"), &event)
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::relay::push::RelayEventTooLarge>()
+                .is_some(),
+            "transactional insert must return the same typed admission error"
+        );
+        assert!(
+            db.get_instance_full("luna").unwrap().is_some(),
+            "oversize failure must roll back the instance deletion"
+        );
+        let event_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count, 0, "oversize finalization must insert no event");
+
+        cleanup_test_db(db_path);
     }
 
     #[test]

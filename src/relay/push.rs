@@ -13,8 +13,8 @@ use crate::log;
 
 use super::crypto;
 use super::{
-    MAX_RELAY_PACKET_BYTES, device_short_id_for_db, safe_kv_get, safe_kv_set, set_relay_status,
-    state_topic,
+    MAX_RELAY_EVENT_BYTES, MAX_RELAY_PACKET_BYTES, device_short_id_for_db, safe_kv_get,
+    safe_kv_set, set_relay_status, state_topic,
 };
 
 const RETAINED_EVENT_TAIL: i64 = 50;
@@ -24,6 +24,104 @@ const MAX_NEW_EVENTS_PER_PACKET: usize = 100;
 struct EventRow {
     id: i64,
     value: Value,
+}
+
+#[derive(Serialize)]
+struct RelayEventValue<'a> {
+    id: i64,
+    ts: &'a str,
+    #[serde(rename = "type")]
+    event_type: &'a str,
+    instance: &'a str,
+    data: &'a Value,
+}
+
+/// Typed local-admission failure retained inside `anyhow::Error` for callers
+/// that need to render the actual and allowed serialized sizes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelayEventTooLarge {
+    pub actual_bytes: usize,
+    pub allowed_bytes: usize,
+}
+
+impl std::fmt::Display for RelayEventTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "relay event is {} bytes after serialization; limit is {} bytes",
+            self.actual_bytes, self.allowed_bytes
+        )
+    }
+}
+
+impl std::error::Error for RelayEventTooLarge {}
+
+fn relay_event_value(
+    id: i64,
+    timestamp: &str,
+    event_type: &str,
+    instance: &str,
+    data: &Value,
+) -> Result<Value, serde_json::Error> {
+    serde_json::to_value(RelayEventValue {
+        id,
+        ts: timestamp,
+        event_type,
+        instance,
+        data,
+    })
+}
+
+/// Measure the exact relay representation used by `load_event_rows`, reserving
+/// the worst-case positive SQLite row ID because admission runs before insert.
+pub(crate) fn local_relay_event_serialized_size(
+    timestamp: &str,
+    event_type: &str,
+    instance: &str,
+    data: &Value,
+) -> Result<usize, serde_json::Error> {
+    serde_json::to_vec(&RelayEventValue {
+        id: i64::MAX,
+        ts: timestamp,
+        event_type,
+        instance,
+        data,
+    })
+    .map(|bytes| bytes.len())
+}
+
+/// Central local-event admission gate. Authenticated peer imports deliberately
+/// use their separate persistence entry point instead of calling this function.
+pub(crate) fn validate_local_relay_event(
+    timestamp: &str,
+    event_type: &str,
+    instance: &str,
+    data: &Value,
+) -> anyhow::Result<()> {
+    let actual_bytes = local_relay_event_serialized_size(timestamp, event_type, instance, data)?;
+    if actual_bytes <= MAX_RELAY_EVENT_BYTES {
+        return Ok(());
+    }
+
+    let actual = actual_bytes.to_string();
+    let allowed = MAX_RELAY_EVENT_BYTES.to_string();
+    log::log_with_fields(
+        "WARN",
+        "db",
+        "relay.event_rejected",
+        "",
+        &[
+            ("type", event_type),
+            ("instance", instance),
+            ("actual_bytes", &actual),
+            ("allowed_bytes", &allowed),
+        ],
+    );
+    Err(RelayEventTooLarge {
+        actual_bytes,
+        allowed_bytes: MAX_RELAY_EVENT_BYTES,
+    }
+    .into())
 }
 
 /// A complete relay-state publication ready to enqueue. The cursor metadata is
@@ -173,16 +271,9 @@ fn load_event_rows(
             row.map_err(|e| format!("event row: {e}"))?;
         let data: Value = serde_json::from_str(&data_str)
             .map_err(|e| format!("event {id} contains invalid JSON: {e}"))?;
-        Ok(EventRow {
-            id,
-            value: json!({
-                "id": id,
-                "ts": ts,
-                "type": event_type,
-                "instance": instance,
-                "data": data,
-            }),
-        })
+        let value = relay_event_value(id, &ts, &event_type, &instance, &data)
+            .map_err(|e| format!("event {id} serialization: {e}"))?;
+        Ok(EventRow { id, value })
     })
     .collect()
 }
@@ -484,13 +575,18 @@ mod tests {
     fn single_oversized_event_fails_without_advancing_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
-        let event_id = db
-            .log_event(
-                "message",
-                "sender",
-                &json!({"text": "x".repeat(MAX_RELAY_PACKET_BYTES + 8_192)}),
+        // Seed a pre-admission poisoned row directly. Local producers can no
+        // longer create it, but exact packet construction remains the defense
+        // for databases written before the admission gate existed.
+        let data = json!({"text": "x".repeat(MAX_RELAY_PACKET_BYTES + 8_192)}).to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES ('2026-08-10T00:00:00Z', 'message', 'sender', ?)",
+                rusqlite::params![data],
             )
             .unwrap();
+        let event_id = db.conn().last_insert_rowid();
 
         let err = prepare_push(&db, "relay-test", "device-a", &TEST_PSK).unwrap_err();
         assert!(err.contains(&format!("relay event {event_id}")));

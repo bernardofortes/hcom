@@ -478,11 +478,41 @@ impl HcomDb {
             Some(t) => t.to_string(),
             None => chrono_now_iso(),
         };
+
+        crate::relay::push::validate_local_relay_event(&ts, event_type, instance, data)?;
+        self.insert_event_with_ts(event_type, instance, data, &ts)
+    }
+
+    /// Persist an event received through the authenticated relay envelope.
+    ///
+    /// The complete inbound PUBLISH has already passed the relay packet budget,
+    /// so this explicit trust-boundary path must not re-apply local admission.
+    pub(crate) fn log_authenticated_imported_event_with_ts(
+        &self,
+        event_type: &str,
+        instance: &str,
+        data: &serde_json::Value,
+        timestamp: Option<&str>,
+    ) -> Result<i64> {
+        let ts = match timestamp {
+            Some(t) => t.to_string(),
+            None => chrono_now_iso(),
+        };
+        self.insert_event_with_ts(event_type, instance, data, &ts)
+    }
+
+    fn insert_event_with_ts(
+        &self,
+        event_type: &str,
+        instance: &str,
+        data: &serde_json::Value,
+        timestamp: &str,
+    ) -> Result<i64> {
         let data_str = serde_json::to_string(data)?;
 
         self.conn.execute(
             "INSERT INTO events (timestamp, type, instance, data) VALUES (?, ?, ?, ?)",
-            params![ts, event_type, instance, data_str],
+            params![timestamp, event_type, instance, data_str],
         )?;
         let event_id = self.conn.last_insert_rowid();
 
@@ -602,6 +632,65 @@ impl HcomDb {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{cleanup_test_db, setup_full_test_db};
+
+    #[test]
+    fn relay_event_admission_accepts_boundary_and_rejects_one_byte_over() {
+        let (db, db_path) = setup_full_test_db();
+        let timestamp = "2026-08-10T00:00:00Z";
+        let empty = serde_json::json!({"text": ""});
+        let base = crate::relay::push::local_relay_event_serialized_size(
+            timestamp, "message", "sender", &empty,
+        )
+        .unwrap();
+        let boundary = serde_json::json!({
+            "text": "x".repeat(crate::relay::MAX_RELAY_EVENT_BYTES - base)
+        });
+        assert_eq!(
+            crate::relay::push::local_relay_event_serialized_size(
+                timestamp, "message", "sender", &boundary,
+            )
+            .unwrap(),
+            crate::relay::MAX_RELAY_EVENT_BYTES
+        );
+
+        let accepted_id = db
+            .log_event_with_ts("message", "sender", &boundary, Some(timestamp))
+            .unwrap();
+        assert!(accepted_id > 0);
+
+        let over = serde_json::json!({
+            "text": "x".repeat(crate::relay::MAX_RELAY_EVENT_BYTES - base + 1)
+        });
+        let error = db
+            .log_event_with_ts("message", "sender", &over, Some(timestamp))
+            .unwrap_err();
+        let oversized = error
+            .downcast_ref::<crate::relay::push::RelayEventTooLarge>()
+            .expect("one-byte oversize must retain its typed admission error");
+        assert_eq!(
+            oversized.actual_bytes,
+            crate::relay::MAX_RELAY_EVENT_BYTES + 1
+        );
+        assert_eq!(oversized.allowed_bytes, crate::relay::MAX_RELAY_EVENT_BYTES);
+
+        let forged_import = serde_json::json!({
+            "text": "x".repeat(crate::relay::MAX_RELAY_EVENT_BYTES),
+            "_relay": {"device": "untrusted"}
+        });
+        assert!(
+            db.log_event_with_ts("message", "sender", &forged_import, Some(timestamp))
+                .is_err(),
+            "a caller-provided _relay field must not bypass local admission"
+        );
+
+        let row_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 1, "rejected events must receive no row or ID");
+
+        cleanup_test_db(db_path);
+    }
 
     #[test]
     fn test_log_event_returns_id() {

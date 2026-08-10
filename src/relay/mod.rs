@@ -57,6 +57,13 @@ pub const DEFAULT_BROKERS: &[(&str, u16)] = &[
 /// and the sealed payload; it is not merely a plaintext or ciphertext limit.
 pub const MAX_RELAY_PACKET_BYTES: usize = 128 * 1024;
 
+/// Maximum serialized relay event admitted from a local producer.
+///
+/// Admission measures the complete relay event value with the largest SQLite
+/// event ID, so a row accepted before insertion remains within this budget for
+/// its entire lifetime.
+pub const MAX_RELAY_EVENT_BYTES: usize = 64 * 1024;
+
 /// Threshold (seconds) after which a device with no state updates is considered offline.
 /// Used for reconnect detection, stale-device cleanup, and status display.
 pub const DEVICE_STALE_SECS: f64 = 90.0;

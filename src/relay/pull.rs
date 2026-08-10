@@ -667,7 +667,12 @@ fn import_remote_events(
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        let _ = db.log_event_with_ts(event_type, &namespaced_instance, &data, Some(&ts_str));
+        let _ = db.log_authenticated_imported_event_with_ts(
+            event_type,
+            &namespaced_instance,
+            &data,
+            Some(&ts_str),
+        );
 
         // Log per-message latency for message events
         if event_type == "message" && event_ts > 0.0 {
@@ -775,6 +780,75 @@ mod tests {
         let bytes = serde_json::to_vec(payload).unwrap();
         let now = crate::shared::time::now_epoch_f64() as u64;
         crate::relay::crypto::seal(&psk, relay_id, topic, &bytes, now).unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn imported_event_admission_accepts_authenticated_peer_without_local_readmission() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let timestamp = "2026-08-10T00:00:00Z";
+        let remote_data = json!({
+            "from": "sender",
+            "text": "x".repeat(crate::relay::MAX_RELAY_EVENT_BYTES)
+        });
+        assert!(
+            crate::relay::push::local_relay_event_serialized_size(
+                timestamp,
+                "message",
+                "sender",
+                &remote_data,
+            )
+            .unwrap()
+                > crate::relay::MAX_RELAY_EVENT_BYTES,
+            "fixture must exceed local admission before import"
+        );
+        let payload = json!({
+            "state": {
+                "short_id": "ABCD",
+                "reset_ts": 0.0,
+                "instances": {}
+            },
+            "events": [{
+                "id": 1,
+                "ts": timestamp,
+                "type": "message",
+                "instance": "sender",
+                "data": remote_data
+            }]
+        });
+
+        let topic = "relay-test/device-1234";
+        let envelope = seal_for_test(&payload, topic, "relay-test");
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+        handle_state_message(
+            &db,
+            "device-1234",
+            &envelope,
+            "own-device-5678",
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+            },
+        );
+
+        let imported: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'message' AND instance = 'sender:ABCD'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("authenticated oversized peer event should be imported");
+        let imported: Value = serde_json::from_str(&imported).unwrap();
+        assert_eq!(
+            imported["text"].as_str().map(str::len),
+            Some(crate::relay::MAX_RELAY_EVENT_BYTES)
+        );
+        assert_eq!(imported["_relay"]["device"], "device-1234");
     }
 
     #[test]
