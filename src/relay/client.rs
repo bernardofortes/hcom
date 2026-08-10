@@ -20,9 +20,27 @@ use serde_json::json;
 
 use super::replay::ReplayGuard;
 use super::{
-    MAX_RELAY_PACKET_BYTES, get_broker_from_config, is_relay_enabled, load_psk,
-    read_device_identity, read_device_uuid, set_relay_status, state_topic, wildcard_topic,
+    DeviceIdentity, DeviceIdentityError, MAX_RELAY_PACKET_BYTES, get_broker_from_config,
+    is_relay_enabled, load_psk, read_device_identity, set_relay_status, state_topic,
+    wildcard_topic,
 };
+
+#[derive(Debug)]
+pub enum MqttRelayConnectError {
+    Identity(DeviceIdentityError),
+    Other(String),
+}
+
+impl std::fmt::Display for MqttRelayConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Identity(error) => write!(f, "failed to initialize relay identity: {error}"),
+            Self::Other(error) => f.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for MqttRelayConnectError {}
 
 /// Build a TLS config that combines webpki-roots (bundled Mozilla CAs for Android/Termux
 /// compatibility) with native system certs (for private broker support).
@@ -159,7 +177,7 @@ fn release_pending_on_new_session(
 pub struct MqttRelay {
     client: Client,
     relay_id: String,
-    device_uuid: String,
+    identity: DeviceIdentity,
     /// Active sealing key. Guarded by a mutex so future refactors cannot
     /// accidentally make concurrent access compile.
     psk: Mutex<[u8; 32]>,
@@ -187,22 +205,27 @@ impl MqttRelay {
     /// lets external code trigger pushes or shutdown.
     pub fn connect(
         config: &HcomConfig,
-    ) -> Result<(Self, Connection, mpsc::Sender<RelayCommand>), String> {
+    ) -> Result<(Self, Connection, mpsc::Sender<RelayCommand>), MqttRelayConnectError> {
         if !is_relay_enabled(config) {
-            return Err("relay not configured or disabled".into());
+            return Err(MqttRelayConnectError::Other(
+                "relay not configured or disabled".into(),
+            ));
         }
 
-        let (host, port, use_tls) = get_broker_from_config(config).ok_or("no broker configured")?;
+        let (host, port, use_tls) = get_broker_from_config(config)
+            .ok_or_else(|| MqttRelayConnectError::Other("no broker configured".into()))?;
 
-        let psk = load_psk(config)?;
+        let psk = load_psk(config).map_err(MqttRelayConnectError::Other)?;
 
         let relay_id = config.relay_id.clone();
-        let identity_db = HcomDb::open()
-            .map_err(|error| format!("failed to open database for relay identity: {error}"))?;
-        let device_uuid = read_device_identity(&identity_db)
-            .map_err(|error| format!("failed to initialize relay identity: {error}"))?
-            .uuid;
-        let client_id = format!("hcom-{}", super::device_id_prefix(&device_uuid));
+        let identity_db = HcomDb::open().map_err(|error| {
+            MqttRelayConnectError::Other(format!(
+                "failed to open database for relay identity: {error}"
+            ))
+        })?;
+        let identity =
+            read_device_identity(&identity_db).map_err(MqttRelayConnectError::Identity)?;
+        let client_id = format!("hcom-{}", super::device_id_prefix(&identity.uuid));
 
         let mut mqttoptions = MqttOptions::new(&client_id, &host, port);
         mqttoptions.set_keep_alive(Duration::from_secs(30));
@@ -224,7 +247,7 @@ impl MqttRelay {
         // An LWT cannot be freshly sealed when the broker emits it. Use an
         // empty retained payload to clear the broker snapshot; peers ignore
         // the unauthenticated payload and fall back to stale-device detection.
-        let lwt_topic = state_topic(&relay_id, &device_uuid);
+        let lwt_topic = state_topic(&relay_id, &identity.uuid);
         let lwt = rumqttc::v5::mqttbytes::v5::LastWill {
             topic: lwt_topic.clone().into(),
             message: bytes::Bytes::new(),
@@ -242,7 +265,7 @@ impl MqttRelay {
         let relay = MqttRelay {
             client,
             relay_id,
-            device_uuid,
+            identity,
             psk: Mutex::new(psk),
             replay_guard: Mutex::new(ReplayGuard::default()),
             cmd_rx,
@@ -714,16 +737,16 @@ impl MqttRelay {
         };
 
         if suffix == "control" {
-            super::pull::handle_control_message(&db, payload, &self.device_uuid, &mut ctx)
+            super::pull::handle_control_message(&db, payload, &self.identity, &mut ctx)
         } else {
             // State message from a remote device
             let device_id = suffix;
-            if device_id == self.device_uuid {
+            if device_id == self.identity.uuid {
                 return false; // Ignore own messages
             }
             // MQTT RETAIN is delivery metadata, not authenticated state
             // freshness. State ordering comes from the sealed timestamp.
-            super::pull::handle_state_message(&db, device_id, payload, &self.device_uuid, &mut ctx)
+            super::pull::handle_state_message(&db, device_id, payload, &self.identity, &mut ctx)
         }
     }
 
@@ -792,8 +815,7 @@ impl MqttRelay {
             return;
         }
 
-        let prepared = match super::push::prepare_push(&db, &self.relay_id, &self.device_uuid, &psk)
-        {
+        let prepared = match super::push::prepare_push(&db, &self.relay_id, &self.identity, &psk) {
             Ok(prepared) => prepared,
             Err(e) => {
                 log::log_warn("relay", "relay.push_err", &e);
@@ -880,7 +902,7 @@ impl MqttRelay {
             return;
         }
 
-        let topic = state_topic(&self.relay_id, &self.device_uuid);
+        let topic = state_topic(&self.relay_id, &self.identity.uuid);
         log::log_info(
             "relay",
             "relay.shutdown_graceful",
@@ -942,7 +964,12 @@ impl MqttRelay {
 
     /// Get device_uuid.
     pub fn device_uuid(&self) -> &str {
-        &self.device_uuid
+        &self.identity.uuid
+    }
+
+    /// Get the durable assigned device short name.
+    pub fn device_short_name(&self) -> &str {
+        &self.identity.short_name
     }
 }
 
@@ -1112,29 +1139,26 @@ pub fn create_ephemeral_client(config: &HcomConfig) -> Option<EphemeralClient> {
 
 /// Publish an authenticated retained tombstone to clear device state and
 /// disconnect an ephemeral client. Literal empty MQTT payloads are ignored.
-pub fn clear_retained_state(config: &HcomConfig) -> bool {
+pub fn clear_retained_state(config: &HcomConfig, db: &HcomDb) -> Result<bool, DeviceIdentityError> {
     if config.relay_id.is_empty() {
-        return false;
+        return Ok(false);
     }
     let relay_id = &config.relay_id;
 
-    let device_uuid = match read_device_uuid() {
-        Some(uuid) => uuid,
-        None => return false,
-    };
-    let topic = state_topic(relay_id, &device_uuid);
+    let identity = read_device_identity(db)?;
+    let topic = state_topic(relay_id, &identity.uuid);
     let psk = match load_psk(config) {
         Ok(psk) => psk,
-        Err(_) => return false,
+        Err(_) => return Ok(false),
     };
     let sealed = match seal_state_tombstone(&psk, relay_id, &topic) {
         Ok(sealed) => sealed,
-        Err(_) => return false,
+        Err(_) => return Ok(false),
     };
 
     let client = match create_ephemeral_client(config) {
         Some(c) => c,
-        None => return false,
+        None => return Ok(false),
     };
 
     let result = client.publish_and_wait(
@@ -1146,7 +1170,7 @@ pub fn clear_retained_state(config: &HcomConfig) -> bool {
     );
 
     client.disconnect();
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1165,6 +1189,66 @@ mod tests {
             max_event_id,
             has_more,
         }
+    }
+
+    #[test]
+    #[serial]
+    fn durable_identity_consumers_durable_identity_after_reset_worker_carries_exact_identity() {
+        const UUID: &str = "canonical-own-device-uuid";
+        const NAME: &str = "GIGA";
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        assert_ne!(super::super::device_short_id(UUID), NAME);
+        std::fs::write(crate::paths::device_id_path_at(&hcom_dir), UUID).unwrap();
+        std::fs::write(crate::paths::device_name_path_at(&hcom_dir), NAME).unwrap();
+        let config = HcomConfig {
+            relay: "mqtt://127.0.0.1:1".to_string(),
+            relay_id: "relay-identity-test".to_string(),
+            relay_psk: super::super::encode_psk(&[0x68u8; 32]),
+            relay_enabled: true,
+            ..Default::default()
+        };
+
+        let (relay, connection, _commands) = MqttRelay::connect(&config).unwrap();
+        assert_eq!(relay.device_uuid(), UUID);
+        assert_eq!(relay.device_short_name(), NAME);
+        drop(connection);
+        drop(relay);
+
+        let db = HcomDb::open().unwrap();
+        assert_eq!(
+            safe_kv_get(&db, &format!("relay_uuid_short_{UUID}")).as_deref(),
+            Some(NAME)
+        );
+        assert_eq!(
+            safe_kv_get(&db, &format!("relay_short_{NAME}")).as_deref(),
+            Some(UUID)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn durable_identity_consumers_worker_client_preserves_typed_conflict() {
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        std::fs::write(crate::paths::device_id_path_at(&hcom_dir), "durable-uuid").unwrap();
+        let legacy = crate::paths::legacy_device_id_path_at(&hcom_dir);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(legacy, "different-legacy-uuid").unwrap();
+        let config = HcomConfig {
+            relay: "mqtt://127.0.0.1:1".to_string(),
+            relay_id: "relay-identity-test".to_string(),
+            relay_psk: super::super::encode_psk(&[0x69u8; 32]),
+            relay_enabled: true,
+            ..Default::default()
+        };
+
+        let error = match MqttRelay::connect(&config) {
+            Ok(_) => panic!("conflicting durable identity must stop client initialization"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            MqttRelayConnectError::Identity(DeviceIdentityError::Conflict { .. })
+        ));
     }
 
     #[test]

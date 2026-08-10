@@ -891,20 +891,29 @@ impl HcomDb {
 
     /// Log _device reset event + set relay timestamp. Call after any DB archive/reset.
     pub fn log_reset_event(&self) -> Result<()> {
-        // Derive hcom_dir from db_path (db is at hcom_dir/hcom.db)
+        // Resolve the typed durable identity beside this exact database. This
+        // also restores both mapping directions in a freshly reset database
+        // before any reset event or other consumer can observe it.
         let hcom_dir = self
             .db_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
-        let device_id = std::fs::read_to_string(hcom_dir.join(".tmp").join("device_uuid"))
-            .unwrap_or_else(|_| "unknown".to_string())
-            .trim()
-            .to_string();
+        let has_uuid_source = crate::paths::device_id_path_at(hcom_dir).exists()
+            || crate::paths::legacy_device_id_path_at(hcom_dir).exists();
+        let has_name_source = crate::paths::device_name_path_at(hcom_dir).exists();
+        if !has_uuid_source && !has_name_source {
+            // Factory reset deliberately leaves identity absent until the next
+            // real identity consumer. Preserve that reset-all contract rather
+            // than creating an identity merely to describe the reset itself.
+            self.kv_set("relay_local_reset_ts", Some(&now_epoch_f64().to_string()))?;
+            return Ok(());
+        }
+        let identity = crate::relay::read_device_identity_at(hcom_dir, self)?;
 
         self.log_event(
             "life",
             "_device",
-            &serde_json::json!({"action": "reset", "device": device_id}),
+            &serde_json::json!({"action": "reset", "device": identity.uuid}),
         )?;
 
         self.kv_set("relay_local_reset_ts", Some(&now_epoch_f64().to_string()))?;
@@ -991,6 +1000,85 @@ pub(super) mod tests {
     fn mode(path: &std::path::Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn durable_identity_consumers_reset_event_records_exact_canonical_uuid() {
+        const UUID: &str = "canonical-own-device-uuid";
+        const NAME: &str = "GIGA";
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        std::fs::write(crate::paths::device_id_path_at(&hcom_dir), UUID).unwrap();
+        std::fs::write(crate::paths::device_name_path_at(&hcom_dir), NAME).unwrap();
+        let db = HcomDb::open().unwrap();
+
+        db.log_reset_event().unwrap();
+        let device: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.device') FROM events WHERE type = 'life' AND instance = '_device' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(device, UUID);
+        assert_eq!(
+            db.kv_get(&format!("relay_uuid_short_{UUID}"))
+                .unwrap()
+                .as_deref(),
+            Some(NAME)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn durable_identity_after_reset_restores_mapping_before_exact_reset_event() {
+        const UUID: &str = "canonical-own-device-uuid";
+        const NAME: &str = "GIGA";
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        std::fs::write(crate::paths::device_id_path_at(&hcom_dir), UUID).unwrap();
+        std::fs::write(crate::paths::device_name_path_at(&hcom_dir), NAME).unwrap();
+        let original = HcomDb::open().unwrap();
+        assert_eq!(
+            crate::relay::read_device_identity(&original).unwrap().uuid,
+            UUID
+        );
+        drop(original);
+
+        // A separate empty database under the preserved HCOM_DIR models the
+        // post-reset database before any relay consumer has run.
+        let fresh = HcomDb::open_at(&hcom_dir.join("fresh.db")).unwrap();
+        assert!(
+            fresh
+                .kv_get(&format!("relay_uuid_short_{UUID}"))
+                .unwrap()
+                .is_none()
+        );
+        fresh.log_reset_event().unwrap();
+
+        assert_eq!(
+            fresh
+                .kv_get(&format!("relay_uuid_short_{UUID}"))
+                .unwrap()
+                .as_deref(),
+            Some(NAME)
+        );
+        assert_eq!(
+            fresh
+                .kv_get(&format!("relay_short_{NAME}"))
+                .unwrap()
+                .as_deref(),
+            Some(UUID)
+        );
+        let device: String = fresh
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.device') FROM events WHERE type = 'life' AND instance = '_device' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(device, UUID);
     }
 
     #[cfg(unix)]

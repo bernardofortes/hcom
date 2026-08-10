@@ -394,23 +394,32 @@ fn known_remote_device_shorts(db: &HcomDb, own_device: &str) -> Vec<String> {
     shorts
 }
 
-fn relay_notify_off_all(db: &HcomDb, config: &crate::config::HcomConfig, own_device: &str) {
+fn relay_notify_off_all(
+    db: &HcomDb,
+    config: &crate::config::HcomConfig,
+    own_device: &str,
+) -> Result<(), i32> {
     let peers = known_remote_device_shorts(db, own_device);
     if peers.is_empty() {
         println!("No known remote peers to notify.");
-        return;
+        return Ok(());
     }
 
     let mut sent = 0usize;
     for short in &peers {
-        if relay::control::send_one_way_control_ephemeral(
+        match relay::control::send_one_way_control_ephemeral(
             db,
             config,
             "relay_off",
             short,
             &serde_json::json!({}),
         ) {
-            sent += 1;
+            Ok(true) => sent += 1,
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("Error: {error}");
+                return Err(1);
+            }
         }
     }
 
@@ -418,6 +427,7 @@ fn relay_notify_off_all(db: &HcomDb, config: &crate::config::HcomConfig, own_dev
         "Best-effort relay_off sent to {sent}/{} known remote peer(s).",
         peers.len()
     );
+    Ok(())
 }
 
 fn relay_off(db: &HcomDb, argv: &[String]) -> i32 {
@@ -433,14 +443,16 @@ fn relay_off(db: &HcomDb, argv: &[String]) -> i32 {
         eprintln!("Run: hcom relay new");
         return 1;
     }
+    let identity = match require_relay_identity(db) {
+        Ok(identity) => identity,
+        Err(code) => return code,
+    };
 
     if all {
         if config.relay_enabled {
-            let identity = match require_relay_identity(db) {
-                Ok(identity) => identity,
-                Err(code) => return code,
-            };
-            relay_notify_off_all(db, &config, &identity.uuid);
+            if let Err(code) = relay_notify_off_all(db, &config, &identity.uuid) {
+                return code;
+            }
         } else {
             println!("Relay already disabled locally; skipping remote shutdown broadcast.");
         }
@@ -857,6 +869,34 @@ mod tests {
 
     fn fake_psk() -> [u8; 32] {
         [0x44; 32]
+    }
+
+    #[test]
+    #[serial]
+    fn durable_identity_consumers_durable_identity_after_reset_cli_requires_exact_identity() {
+        const UUID: &str = "canonical-own-device-uuid";
+        const NAME: &str = "GIGA";
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        assert_ne!(relay::device_short_id(UUID), NAME);
+        std::fs::write(crate::paths::device_id_path_at(&hcom_dir), UUID).unwrap();
+        std::fs::write(crate::paths::device_name_path_at(&hcom_dir), NAME).unwrap();
+        let db = HcomDb::open().unwrap();
+
+        let identity = require_relay_identity(&db).unwrap();
+        assert_eq!(identity.uuid, UUID);
+        assert_eq!(identity.short_name, NAME);
+        assert_eq!(
+            db.kv_get(&format!("relay_uuid_short_{UUID}"))
+                .unwrap()
+                .as_deref(),
+            Some(NAME)
+        );
+        assert_eq!(
+            db.kv_get(&format!("relay_short_{NAME}"))
+                .unwrap()
+                .as_deref(),
+            Some(UUID)
+        );
     }
 
     #[test]

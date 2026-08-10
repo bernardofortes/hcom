@@ -6,7 +6,9 @@
 use rusqlite::{Connection, params};
 use std::path::PathBuf;
 
+use crate::db::HcomDb;
 use crate::log::log_warn;
+use crate::relay::DeviceIdentity;
 use crate::tui::app::DataState;
 use crate::tui::data::DataSource;
 use crate::tui::model::*;
@@ -23,14 +25,10 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Local device UUID from kv table.
-fn read_device_uuid(conn: &Connection) -> String {
-    kv_get(conn, "device_uuid").unwrap_or_default()
-}
-
 pub struct DbDataSource {
     db_path: PathBuf,
     conn: Option<Connection>,
+    identity: Option<DeviceIdentity>,
     last_data_version: u64,
     cached: Option<DataState>,
     last_error: Option<String>,
@@ -49,6 +47,7 @@ impl DbDataSource {
         Self {
             db_path: paths::db_path(),
             conn: None,
+            identity: None,
             last_data_version: 0,
             cached: None,
             last_error: None,
@@ -63,13 +62,36 @@ impl DbDataSource {
             // Harden before opening: the TUI is the no-arg default entry point,
             // so it must apply the same owner-only permission boundary as the
             // CLI rather than letting SQLite create/leave a broad db.
-            let hcom_dir = paths::hcom_dir();
-            if let Err(e) = paths::ensure_private_directory(&hcom_dir)
+            let hcom_dir = self
+                .db_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            if let Err(e) = paths::ensure_private_directory(hcom_dir)
                 .and_then(|()| paths::ensure_private_db(&self.db_path))
             {
                 self.last_error = Some(format!("secure {}: {}", self.db_path.display(), e));
                 return None;
             }
+            let identity_db = match HcomDb::open_at(&self.db_path) {
+                Ok(db) => db,
+                Err(error) => {
+                    self.last_error = Some(format!(
+                        "open identity database {}: {error}",
+                        self.db_path.display()
+                    ));
+                    return None;
+                }
+            };
+            let identity = match crate::relay::read_device_identity_at(hcom_dir, &identity_db) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    self.last_error = Some(format!("invalid durable relay identity: {error}"));
+                    return None;
+                }
+            };
+            drop(identity_db);
+            // Identity initialization above may restore mappings. The long-lived
+            // snapshot connection itself remains query-only.
             let conn = match Connection::open(&self.db_path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -90,6 +112,7 @@ impl DbDataSource {
                 return None;
             }
             self.conn = Some(conn);
+            self.identity = Some(identity);
             // Force full reload on new connection
             self.last_data_version = 0;
             self.cached = None;
@@ -118,6 +141,13 @@ impl DbDataSource {
 
     /// Run all queries and update cache.
     fn full_load(&mut self) -> DataState {
+        let device_uuid = match &self.identity {
+            Some(identity) => identity.uuid.clone(),
+            None => {
+                self.last_error = Some("durable relay identity is unavailable".to_string());
+                return DataState::empty();
+            }
+        };
         let conn = match &self.conn {
             Some(c) => c,
             None => return DataState::empty(),
@@ -131,7 +161,7 @@ impl DbDataSource {
             .unwrap_or(0);
         self.config_mtime = config_toml_mtime();
 
-        let data = load_all(conn, self.timeline_limit);
+        let data = load_all(conn, self.timeline_limit, &device_uuid);
         self.cached = Some(data.clone());
         data
     }
@@ -188,12 +218,11 @@ impl DataSource for DbDataSource {
 }
 
 /// Run all snapshot queries against the connection.
-fn load_all(conn: &Connection, default_limit: usize) -> DataState {
-    let device_uuid = read_device_uuid(conn);
+fn load_all(conn: &Connection, default_limit: usize, device_uuid: &str) -> DataState {
     let now = epoch_now();
 
     // Load all instances
-    let (mut agents, mut remote_agents) = load_instances(conn, &device_uuid, now);
+    let (mut agents, mut remote_agents) = load_instances(conn, device_uuid, now);
 
     // Compute unread counts
     compute_unread_batch(conn, &mut agents);
@@ -1433,10 +1462,121 @@ mod tests {
         compute_unread_batch, count_gt, load_instances, load_recently_stopped, parse_message_row,
         parse_status_or_life_row, parse_tool,
     };
+    use crate::tui::data::DataSource;
     use crate::tui::model::{
         ActivityKind, Agent, AgentStatus, EventKind, MessageScope, SenderKind, Tool,
     };
     use rusqlite::Connection;
+
+    fn insert_identity_partition_rows(db: &crate::db::HcomDb, own_uuid: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, created_at) VALUES (?1, ?2, 1.0)",
+                rusqlite::params!["local-owned", own_uuid],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, created_at) VALUES (?1, ?2, 2.0)",
+                rusqlite::params!["remote-owned:PEER", "remote-device-uuid"],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn durable_identity_consumers_tui_ignores_dead_kv_and_partitions_by_canonical_uuid() {
+        const UUID: &str = "canonical-own-device-uuid";
+        const NAME: &str = "GIGA";
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        std::fs::write(crate::paths::device_id_path_at(&hcom_dir), UUID).unwrap();
+        std::fs::write(crate::paths::device_name_path_at(&hcom_dir), NAME).unwrap();
+        let db = crate::db::HcomDb::open().unwrap();
+        crate::relay::read_device_identity(&db).unwrap();
+        db.kv_set("device_uuid", Some("wrong-dead-kv-value"))
+            .unwrap();
+        insert_identity_partition_rows(&db, UUID);
+        drop(db);
+
+        let mut source = super::DbDataSource::new();
+        let data = source.load();
+        assert!(source.last_error().is_none());
+        assert_eq!(
+            data.agents
+                .iter()
+                .map(|agent| agent.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local-owned"]
+        );
+        assert_eq!(data.remote_agents.len(), 1);
+        assert_eq!(data.remote_agents[0].name, "remote-owned");
+        assert_eq!(data.remote_agents[0].device_name.as_deref(), Some("PEER"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn durable_identity_consumers_tui_surfaces_typed_identity_conflict() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        std::fs::write(crate::paths::device_id_path_at(&hcom_dir), "durable-uuid").unwrap();
+        let legacy = crate::paths::legacy_device_id_path_at(&hcom_dir);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(legacy, "different-legacy-uuid").unwrap();
+
+        let mut source = super::DbDataSource::new();
+        let data = source.load();
+        assert!(data.agents.is_empty());
+        assert!(data.remote_agents.is_empty());
+        let error = source.last_error().expect("identity conflict must surface");
+        assert!(error.contains("invalid durable relay identity"));
+        assert!(error.contains("conflicting relay DeviceUuid"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn durable_identity_after_reset_tui_restores_mapping_before_partitioning() {
+        const UUID: &str = "canonical-own-device-uuid";
+        const NAME: &str = "GIGA";
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        std::fs::write(crate::paths::device_id_path_at(&hcom_dir), UUID).unwrap();
+        std::fs::write(crate::paths::device_name_path_at(&hcom_dir), NAME).unwrap();
+
+        // This is the post-reset state: durable files survived, while the new
+        // database has no relay identity mapping yet.
+        let fresh = crate::db::HcomDb::open().unwrap();
+        assert!(
+            fresh
+                .kv_get(&format!("relay_uuid_short_{UUID}"))
+                .unwrap()
+                .is_none()
+        );
+        insert_identity_partition_rows(&fresh, UUID);
+        drop(fresh);
+
+        let mut source = super::DbDataSource::new();
+        let data = source.load();
+        assert!(source.last_error().is_none());
+        assert_eq!(data.agents.len(), 1);
+        assert_eq!(data.agents[0].name, "local-owned");
+        assert_eq!(data.remote_agents.len(), 1);
+        assert_eq!(data.remote_agents[0].device_name.as_deref(), Some("PEER"));
+
+        drop(source);
+        let restored = crate::db::HcomDb::open().unwrap();
+        assert_eq!(
+            restored
+                .kv_get(&format!("relay_uuid_short_{UUID}"))
+                .unwrap()
+                .as_deref(),
+            Some(NAME)
+        );
+        assert_eq!(
+            restored
+                .kv_get(&format!("relay_short_{NAME}"))
+                .unwrap()
+                .as_deref(),
+            Some(UUID)
+        );
+    }
 
     // Blocker 1 regression: the no-arg TUI must route through the owner-only
     // permission boundary rather than leaving/creating a broad database. `db_path`

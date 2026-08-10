@@ -13,46 +13,60 @@ use crate::launcher::{self, LaunchParams};
 use crate::log;
 
 use super::{
-    control_topic, crypto, device_short_id_for_db, is_relay_enabled, load_psk, read_device_uuid,
-    safe_kv_get, safe_kv_set,
+    DeviceIdentity, DeviceIdentityError, control_topic, crypto, is_relay_enabled, load_psk,
+    read_device_identity, safe_kv_get, safe_kv_set,
 };
+
+#[derive(Debug)]
+pub enum RelayControlError {
+    Identity(DeviceIdentityError),
+    Other(String),
+}
+
+impl std::fmt::Display for RelayControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Identity(error) => write!(f, "invalid durable relay identity: {error}"),
+            Self::Other(error) => f.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for RelayControlError {}
 
 /// Build a sealed RPC control envelope ready to publish. Returns the topic and
 /// the AEAD-sealed bytes; the underlying JSON layout is unchanged from the
 /// pre-encryption format so callers don't have to know about the cipher.
 fn build_control_payload(
-    db: &HcomDb,
+    identity: &DeviceIdentity,
     config: &HcomConfig,
     action: &str,
     target_device_short_id: &str,
     request_id: Option<&str>,
     params: &serde_json::Value,
-) -> Option<(String, Vec<u8>)> {
+) -> Result<(String, Vec<u8>), RelayControlError> {
     if !is_relay_enabled(config) {
-        return None;
+        return Err(RelayControlError::Other(
+            "relay not configured or disabled".to_string(),
+        ));
     }
 
     let relay_id = &config.relay_id;
     if relay_id.is_empty() {
-        return None;
+        return Err(RelayControlError::Other("relay ID is missing".to_string()));
     }
 
-    let psk = match load_psk(config) {
-        Ok(p) => p,
-        Err(e) => {
-            crate::log::log_warn("relay", "relay.psk_missing", &e);
-            return None;
-        }
-    };
+    let psk = load_psk(config).map_err(|error| {
+        crate::log::log_warn("relay", "relay.psk_missing", &error);
+        RelayControlError::Other(error)
+    })?;
 
-    let device_id = read_device_uuid()?;
-    let short_id = device_short_id_for_db(db, &device_id);
     let now = crate::shared::time::now_epoch_f64();
     let mut control_data = json!({
         "action": action,
         "target_device": target_device_short_id,
-        "from": format!("_:{}", short_id),
-        "from_device": device_id,
+        "from": format!("_:{}", identity.short_name),
+        "from_device": identity.uuid,
         "params": params,
     });
     if let Some(request_id) = request_id {
@@ -60,7 +74,7 @@ fn build_control_payload(
     }
 
     let control_payload = json!({
-        "from_device": device_id,
+        "from_device": identity.uuid,
         "events": [{
             "ts": now,
             "type": "control",
@@ -70,9 +84,11 @@ fn build_control_payload(
     });
 
     let topic = control_topic(relay_id);
-    let plaintext = serde_json::to_vec(&control_payload).ok()?;
-    let sealed = crypto::seal(&psk, relay_id, &topic, &plaintext, now as u64).ok()?;
-    Some((topic, sealed))
+    let plaintext = serde_json::to_vec(&control_payload)
+        .map_err(|error| RelayControlError::Other(format!("control serialization: {error}")))?;
+    let sealed = crypto::seal(&psk, relay_id, &topic, &plaintext, now as u64)
+        .map_err(|error| RelayControlError::Other(format!("control encryption: {error}")))?;
+    Ok((topic, sealed))
 }
 
 pub fn build_rpc_control_payload(
@@ -82,9 +98,10 @@ pub fn build_rpc_control_payload(
     target_device_short_id: &str,
     request_id: &str,
     params: &serde_json::Value,
-) -> Option<(String, Vec<u8>)> {
+) -> Result<(String, Vec<u8>), RelayControlError> {
+    let identity = read_device_identity(db).map_err(RelayControlError::Identity)?;
     build_control_payload(
-        db,
+        &identity,
         config,
         action,
         target_device_short_id,
@@ -94,25 +111,22 @@ pub fn build_rpc_control_payload(
 }
 
 fn send_control_via_ephemeral(
-    db: &HcomDb,
+    identity: &DeviceIdentity,
     config: &HcomConfig,
     client: &super::client::EphemeralClient,
     action: &str,
     target_device_short_id: &str,
     request_id: Option<&str>,
     params: &serde_json::Value,
-) -> bool {
-    let (topic, payload_bytes) = match build_control_payload(
-        db,
+) -> Result<bool, RelayControlError> {
+    let (topic, payload_bytes) = build_control_payload(
+        identity,
         config,
         action,
         target_device_short_id,
         request_id,
         params,
-    ) {
-        Some(v) => v,
-        None => return false,
-    };
+    )?;
 
     let result = client.publish_and_wait(
         &topic,
@@ -148,7 +162,7 @@ fn send_control_via_ephemeral(
         log::log_warn("relay", "relay.network", "control: PUBACK timeout");
     }
 
-    result
+    Ok(result)
 }
 
 /// Send an RPC control command using an ephemeral client.
@@ -159,14 +173,17 @@ pub fn send_rpc_control_ephemeral(
     target_device_short_id: &str,
     request_id: &str,
     params: &serde_json::Value,
-) -> bool {
+) -> Result<bool, RelayControlError> {
+    // Resolve identity before network setup so a typed local conflict is never
+    // disguised as an ephemeral connection failure.
+    let identity = read_device_identity(db).map_err(RelayControlError::Identity)?;
     let ephemeral = match super::client::create_ephemeral_client(config) {
         Some(c) => c,
-        None => return false,
+        None => return Ok(false),
     };
 
     let result = send_control_via_ephemeral(
-        db,
+        &identity,
         config,
         &ephemeral,
         action,
@@ -185,14 +202,17 @@ pub fn send_one_way_control_ephemeral(
     action: &str,
     target_device_short_id: &str,
     params: &serde_json::Value,
-) -> bool {
+) -> Result<bool, RelayControlError> {
+    // Resolve identity before network setup so a typed local conflict is never
+    // disguised as an ephemeral connection failure.
+    let identity = read_device_identity(db).map_err(RelayControlError::Identity)?;
     let ephemeral = match super::client::create_ephemeral_client(config) {
         Some(c) => c,
-        None => return false,
+        None => return Ok(false),
     };
 
     let result = send_control_via_ephemeral(
-        db,
+        &identity,
         config,
         &ephemeral,
         action,
@@ -256,6 +276,9 @@ pub fn send_rpc_request_and_wait_with_db(
     params: &serde_json::Value,
     timeout: Duration,
 ) -> Result<Value, String> {
+    // Preserve the typed identity diagnosis before the worker's boolean spawn
+    // API can reduce startup failure to "not running".
+    read_device_identity(db).map_err(|error| RelayControlError::Identity(error).to_string())?;
     if !super::worker::ensure_worker(false) {
         return Err("relay worker not running - start with: hcom relay on".to_string());
     }
@@ -272,14 +295,16 @@ pub fn send_rpc_request_and_wait_with_db(
         }
 
         let request_id = uuid::Uuid::new_v4().to_string();
-        if !send_rpc_control_ephemeral(
+        let sent = send_rpc_control_ephemeral(
             db,
             config,
             action,
             target_device_short_id,
             &request_id,
             params,
-        ) {
+        )
+        .map_err(|error| error.to_string())?;
+        if !sent {
             if attempt + 1 == max_attempts {
                 return Err(format!("failed to send {} request", action));
             }
@@ -942,13 +967,14 @@ fn reject_remote_secret_field(field: &str) -> Result<(), String> {
     Err(format!("{secret} is not remotely queryable"))
 }
 
-pub fn disable_local_relay(config: &HcomConfig, db: &HcomDb) -> Result<bool, String> {
+pub fn disable_local_relay(config: &HcomConfig, db: &HcomDb) -> Result<bool, RelayControlError> {
     let cleared_remote_state = if config.relay_enabled {
-        super::client::clear_retained_state(config)
+        super::client::clear_retained_state(config, db).map_err(RelayControlError::Identity)?
     } else {
         false
     };
-    crate::commands::config::config_set("relay_enabled", "false")?;
+    crate::commands::config::config_set("relay_enabled", "false")
+        .map_err(RelayControlError::Other)?;
     // Wipe runtime-health KV so a stale "ok"/error/heartbeat from the previous
     // session can't leak into status / TUI / JSON after the subsystem is off.
     // Activity watermarks (relay_last_push_id etc.) are intentionally preserved
@@ -963,7 +989,8 @@ fn handle_remote_relay_off(
     _initiated_by: &str,
     config: &HcomConfig,
 ) -> Result<Value, String> {
-    let cleared_remote_state = disable_local_relay(config, db)?;
+    let cleared_remote_state =
+        disable_local_relay(config, db).map_err(|error| error.to_string())?;
     if super::worker::is_relay_worker_running() {
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(100));
@@ -1479,6 +1506,102 @@ mod tests {
         assert_eq!(data["target_device"], "WXYZ");
         assert_eq!(data["request_id"], "req-launch");
         assert_eq!(data["params"]["tool"], "claude");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn durable_identity_consumers_durable_identity_after_reset_control_uses_exact_sender() {
+        const UUID: &str = "canonical-own-device-uuid";
+        const NAME: &str = "GIGA";
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        assert_ne!(super::super::device_short_id(UUID), NAME);
+        std::fs::write(crate::paths::device_id_path_at(&hcom_dir), UUID).unwrap();
+        std::fs::write(crate::paths::device_name_path_at(&hcom_dir), NAME).unwrap();
+        let db = HcomDb::open().unwrap();
+        let psk = [0x66u8; 32];
+        let config = HcomConfig {
+            relay_id: "relay-identity-test".to_string(),
+            relay_psk: super::super::encode_psk(&psk),
+            relay_enabled: true,
+            ..Default::default()
+        };
+
+        let (topic, sealed) = build_rpc_control_payload(
+            &db,
+            &config,
+            rpc_action::EVENTS,
+            "PEER",
+            "request-identity",
+            &json!({}),
+        )
+        .unwrap();
+        let plaintext =
+            super::super::crypto::open(&psk, &config.relay_id, &topic, &sealed).unwrap();
+        let parsed: Value = serde_json::from_slice(&plaintext).unwrap();
+
+        assert_eq!(parsed["from_device"], UUID);
+        assert_eq!(parsed["events"][0]["data"]["from_device"], UUID);
+        assert_eq!(parsed["events"][0]["data"]["from"], format!("_:{NAME}"));
+        assert_eq!(
+            db.kv_get(&format!("relay_uuid_short_{UUID}"))
+                .unwrap()
+                .as_deref(),
+            Some(NAME)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn durable_identity_consumers_control_payload_preserves_typed_conflict() {
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        std::fs::write(crate::paths::device_id_path_at(&hcom_dir), "durable-uuid").unwrap();
+        let legacy = crate::paths::legacy_device_id_path_at(&hcom_dir);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(legacy, "different-legacy-uuid").unwrap();
+        let db = HcomDb::open().unwrap();
+        let config = HcomConfig {
+            relay_id: "relay-identity-test".to_string(),
+            relay_psk: super::super::encode_psk(&[0x67u8; 32]),
+            relay_enabled: true,
+            ..Default::default()
+        };
+
+        let error = build_rpc_control_payload(
+            &db,
+            &config,
+            rpc_action::EVENTS,
+            "PEER",
+            "request-conflict",
+            &json!({}),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            RelayControlError::Identity(DeviceIdentityError::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn durable_identity_consumers_relay_off_cleanup_preserves_typed_conflict() {
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        std::fs::write(crate::paths::device_id_path_at(&hcom_dir), "durable-uuid").unwrap();
+        let legacy = crate::paths::legacy_device_id_path_at(&hcom_dir);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(legacy, "different-legacy-uuid").unwrap();
+        let db = HcomDb::open().unwrap();
+        let config = HcomConfig {
+            relay_id: "relay-identity-test".to_string(),
+            relay_psk: super::super::encode_psk(&[0x70u8; 32]),
+            relay_enabled: true,
+            ..Default::default()
+        };
+
+        let error = disable_local_relay(&config, &db).unwrap_err();
+        assert!(matches!(
+            error,
+            RelayControlError::Identity(DeviceIdentityError::Conflict { .. })
+        ));
     }
 
     #[test]

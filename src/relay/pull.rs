@@ -13,7 +13,7 @@ use crate::log;
 
 use super::crypto;
 use super::replay::ReplayGuard;
-use super::{device_short_id_for_db, remember_device_short_id, safe_kv_get, safe_kv_set};
+use super::{DeviceIdentity, remember_device_short_id, safe_kv_get, safe_kv_set};
 
 /// Crypto + replay context shared by all inbound message handlers.
 pub struct InboundContext<'a> {
@@ -154,7 +154,7 @@ pub fn handle_device_gone(db: &HcomDb, device_id: &str) {
 pub fn handle_control_message(
     db: &HcomDb,
     payload: &[u8],
-    own_device: &str,
+    own_identity: &DeviceIdentity,
     ctx: &mut InboundContext<'_>,
 ) -> bool {
     let opened =
@@ -177,11 +177,10 @@ pub fn handle_control_message(
         .unwrap_or("unknown");
 
     // Ignore own control messages
-    if source_device == own_device {
+    if source_device == own_identity.uuid {
         return false;
     }
 
-    let own_short_id = device_short_id_for_db(db, own_device);
     let events = if let Some(arr) = data.get("events").and_then(|v| v.as_array()) {
         arr.clone()
     } else if data.get("type").and_then(|v| v.as_str()) == Some("control") {
@@ -190,7 +189,7 @@ pub fn handle_control_message(
         vec![]
     };
 
-    super::control::handle_control_events(db, &events, &own_short_id, source_device)
+    super::control::handle_control_events(db, &events, &own_identity.short_name, source_device)
 }
 
 /// Handle a state message from a remote device.
@@ -198,7 +197,7 @@ pub fn handle_state_message(
     db: &HcomDb,
     device_id: &str,
     payload: &[u8],
-    own_device: &str,
+    own_identity: &DeviceIdentity,
     ctx: &mut InboundContext<'_>,
 ) -> bool {
     let t0 = std::time::Instant::now();
@@ -376,7 +375,6 @@ pub fn handle_state_message(
     }
 
     // Upsert remote instances
-    let own_short_id = device_short_id_for_db(db, own_device);
     let instances = state
         .get("instances")
         .and_then(|v| v.as_object())
@@ -483,7 +481,8 @@ pub fn handle_state_message(
     }
 
     // Handle control events in the events payload
-    let should_push = super::control::handle_control_events(db, &events, &own_short_id, device_id);
+    let should_push =
+        super::control::handle_control_events(db, &events, &own_identity.short_name, device_id);
 
     // Import remote events with dedup
     import_remote_events(
@@ -492,7 +491,7 @@ pub fn handle_state_message(
         &short_id,
         &events,
         local_reset_ts,
-        &own_short_id,
+        &own_identity.short_name,
     );
 
     // Update sync timestamp
@@ -789,6 +788,124 @@ mod tests {
         [0x33; 32]
     }
 
+    fn fixture_local_identity() -> DeviceIdentity {
+        DeviceIdentity {
+            uuid: "own-device-5678".to_string(),
+            short_name: "RONI".to_string(),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn durable_identity_consumers_durable_identity_after_reset_target_and_suffix_use_exact_name() {
+        const UUID: &str = "canonical-own-device-uuid";
+        const NAME: &str = "GIGA";
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        assert_ne!(crate::relay::device_short_id(UUID), NAME);
+        std::fs::write(crate::paths::device_id_path_at(&hcom_dir), UUID).unwrap();
+        std::fs::write(crate::paths::device_name_path_at(&hcom_dir), NAME).unwrap();
+        let db = HcomDb::open().unwrap();
+        let identity = crate::relay::read_device_identity(&db).unwrap();
+        let psk = fixture_psk();
+
+        let control_topic = "relay-test/control";
+        let control_payload = json!({
+            "from_device": "remote-device-uuid",
+            "events": [{
+                "ts": crate::shared::time::now_epoch_f64(),
+                "type": "control",
+                "instance": "_control",
+                "data": {
+                    "action": super::super::control::rpc_action::EVENTS,
+                    "target_device": NAME,
+                    "from": "_:PEER",
+                    "request_id": "identity-target-request",
+                    "params": {}
+                }
+            }]
+        });
+        let control_envelope = seal_for_test(&control_payload, control_topic, "relay-test");
+        let mut control_guard = ReplayGuard::default();
+        assert!(handle_control_message(
+            &db,
+            &control_envelope,
+            &identity,
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic: control_topic,
+                replay_guard: &mut control_guard,
+            },
+        ));
+        let request_id: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.request_id') FROM events WHERE type = 'rpc_result' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(request_id, "identity-target-request");
+
+        let state_topic = "relay-test/remote-device-uuid";
+        let state_payload = json!({
+            "state": {
+                "short_id": "PEER",
+                "reset_ts": 0.0,
+                "instances": {}
+            },
+            "events": [{
+                "id": 1,
+                "ts": crate::shared::time::now_iso(),
+                "type": "message",
+                "instance": "sender",
+                "data": {
+                    "from": "sender",
+                    "mentions": [format!("local:{NAME}")],
+                    "delivered_to": [format!("local:{NAME}")],
+                    "text": "identity suffix proof"
+                }
+            }]
+        });
+        let state_envelope = seal_for_test(&state_payload, state_topic, "relay-test");
+        let mut state_guard = ReplayGuard::default();
+        assert!(!handle_state_message(
+            &db,
+            "remote-device-uuid",
+            &state_envelope,
+            &identity,
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic: state_topic,
+                replay_guard: &mut state_guard,
+            },
+        ));
+        let imported: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'message' AND instance = 'sender:PEER'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let imported: Value = serde_json::from_str(&imported).unwrap();
+        assert_eq!(imported["mentions"], json!(["local"]));
+        assert_eq!(imported["delivered_to"], json!(["local"]));
+        assert_eq!(
+            db.kv_get(&format!("relay_uuid_short_{UUID}"))
+                .unwrap()
+                .as_deref(),
+            Some(NAME)
+        );
+        assert_eq!(
+            db.kv_get(&format!("relay_short_{NAME}"))
+                .unwrap()
+                .as_deref(),
+            Some(UUID)
+        );
+    }
+
     fn seal_for_test(payload: &serde_json::Value, topic: &str, relay_id: &str) -> Vec<u8> {
         let psk = fixture_psk();
         let bytes = serde_json::to_vec(payload).unwrap();
@@ -840,7 +957,7 @@ mod tests {
             &db,
             "device-1234",
             &envelope,
-            "own-device-5678",
+            &fixture_local_identity(),
             &mut InboundContext {
                 psk: &psk,
                 relay_id: "relay-test",
@@ -919,7 +1036,7 @@ mod tests {
             &db,
             "device-1234",
             &envelope,
-            "own-device-5678",
+            &fixture_local_identity(),
             &mut InboundContext {
                 psk: &psk,
                 relay_id: "relay-test",
@@ -963,7 +1080,7 @@ mod tests {
             &db,
             "device-1234",
             &envelope,
-            "own-device-5678",
+            &fixture_local_identity(),
             &mut InboundContext {
                 psk: &psk,
                 relay_id: "relay-test",
@@ -1006,7 +1123,7 @@ mod tests {
             &db,
             "device-1234",
             &envelope,
-            "own-device-5678",
+            &fixture_local_identity(),
             &mut InboundContext {
                 psk: &psk,
                 relay_id: "relay-test",
@@ -1090,7 +1207,7 @@ mod tests {
             &db,
             "remote-device-uuid",
             &envelope,
-            &local_identity.uuid,
+            &local_identity,
             &mut InboundContext {
                 psk: &psk,
                 relay_id: "relay-test",
@@ -1194,7 +1311,7 @@ mod tests {
                 &db,
                 device_id,
                 &envelope,
-                "own-device-5678",
+                &fixture_local_identity(),
                 &mut InboundContext {
                     psk: &psk,
                     relay_id: "relay-test",
@@ -1253,7 +1370,7 @@ mod tests {
             &db,
             "device-1234",
             &envelope,
-            "own-device-5678",
+            &fixture_local_identity(),
             &mut InboundContext {
                 psk: &psk,
                 relay_id: "relay-test",
@@ -1294,7 +1411,7 @@ mod tests {
             &db,
             "device-1234",
             &bad_envelope,
-            "own-device-5678",
+            &fixture_local_identity(),
             &mut InboundContext {
                 psk: &psk,
                 relay_id: "relay-test",
@@ -1312,7 +1429,7 @@ mod tests {
             &db,
             "device-1234",
             &good_envelope,
-            "own-device-5678",
+            &fixture_local_identity(),
             &mut InboundContext {
                 psk: &psk,
                 relay_id: "relay-test",
@@ -1351,7 +1468,7 @@ mod tests {
             &db,
             "device-1234",
             &envelope,
-            "own-device-5678",
+            &fixture_local_identity(),
             &mut InboundContext {
                 psk: &psk,
                 relay_id: "relay-test",

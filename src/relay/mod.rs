@@ -500,13 +500,6 @@ pub fn read_device_identity(db: &HcomDb) -> Result<DeviceIdentity, DeviceIdentit
     read_device_identity_at(&crate::paths::hcom_dir(), db)
 }
 
-/// Transitional UUID-only adapter for consumers moved in Slice 4. Initialization
-/// still goes through the typed durable authority; errors produce no fallback.
-pub fn read_device_uuid() -> Option<String> {
-    let db = HcomDb::open().ok()?;
-    read_device_identity(&db).ok().map(|identity| identity.uuid)
-}
-
 pub(crate) fn remove_device_identity_at(base: &Path) -> Result<(), DeviceIdentityError> {
     let _identity_lock = acquire_device_identity_lock(base)?;
     for path in [
@@ -1450,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_device_uuid_creates_when_missing() {
+    fn test_read_device_identity_creates_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let db = identity_test_db(tmp.path());
         let identity = read_device_identity_at(tmp.path(), &db).expect("should create");
@@ -1463,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_device_uuid_repairs_empty_file() {
+    fn test_read_device_identity_repairs_empty_file() {
         let tmp = tempfile::tempdir().unwrap();
         write_legacy_device_id(tmp.path(), "");
         let db = identity_test_db(tmp.path());
@@ -1479,7 +1472,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_device_uuid_repairs_whitespace_only_file() {
+    fn test_read_device_identity_repairs_whitespace_only_file() {
         let tmp = tempfile::tempdir().unwrap();
         write_legacy_device_id(tmp.path(), "   \n\t  ");
         let db = identity_test_db(tmp.path());
@@ -1495,7 +1488,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_device_uuid_concurrent_first_callers_agree() {
+    fn test_read_device_identity_concurrent_first_callers_agree() {
         let tmp = tempfile::tempdir().unwrap();
         let base = std::sync::Arc::new(tmp.path().to_path_buf());
         // Create the schema before releasing concurrent identity callers.

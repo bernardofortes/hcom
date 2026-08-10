@@ -13,8 +13,8 @@ use crate::log;
 
 use super::crypto;
 use super::{
-    MAX_RELAY_EVENT_BYTES, MAX_RELAY_PACKET_BYTES, device_short_id_for_db, safe_kv_get,
-    safe_kv_set, set_relay_status, state_topic,
+    DeviceIdentity, MAX_RELAY_EVENT_BYTES, MAX_RELAY_PACKET_BYTES, safe_kv_get, safe_kv_set,
+    set_relay_status, state_topic,
 };
 
 const RETAINED_EVENT_TAIL: i64 = 50;
@@ -145,9 +145,7 @@ struct PushPayload<'a> {
 
 /// Build current instance state snapshot for publishing.
 /// Only includes local instances (no origin_device_id).
-pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
-    let short_id = device_short_id_for_db(db, device_uuid);
-
+pub fn build_state(db: &HcomDb, identity: &DeviceIdentity) -> Value {
     let instances = match db.conn().prepare(
         "SELECT name, status, status_context, status_detail, status_time, parent_name,
                 directory, transcript_path,
@@ -230,7 +228,7 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
 
     json!({
         "instances": instances,
-        "short_id": short_id,
+        "short_id": identity.short_name,
         "reset_ts": reset_ts,
         "capabilities": capabilities,
     })
@@ -323,11 +321,11 @@ pub(crate) fn ensure_complete_publish_packet_size(
 pub(crate) fn prepare_push(
     db: &HcomDb,
     relay_id: &str,
-    device_uuid: &str,
+    identity: &DeviceIdentity,
     psk: &[u8; 32],
 ) -> Result<PreparedPush, String> {
-    let state = build_state(db, device_uuid);
-    let topic = state_topic(relay_id, device_uuid);
+    let state = build_state(db, identity);
+    let topic = state_topic(relay_id, &identity.uuid);
     let last_push_id: i64 = safe_kv_get(db, "relay_last_push_id")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
@@ -457,6 +455,44 @@ mod tests {
 
     const TEST_PSK: [u8; 32] = [0x41; 32];
 
+    fn test_identity() -> DeviceIdentity {
+        DeviceIdentity {
+            uuid: "device-a".to_string(),
+            short_name: "RONI".to_string(),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn durable_identity_consumers_durable_identity_after_reset_published_state_uses_exact_name() {
+        const UUID: &str = "canonical-own-device-uuid";
+        const NAME: &str = "GIGA";
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        assert_ne!(super::super::device_short_id(UUID), NAME);
+        std::fs::write(crate::paths::device_id_path_at(&hcom_dir), UUID).unwrap();
+        std::fs::write(crate::paths::device_name_path_at(&hcom_dir), NAME).unwrap();
+        let db = HcomDb::open().unwrap();
+        let identity = super::super::read_device_identity(&db).unwrap();
+
+        let state = build_state(&db, &identity);
+        assert_eq!(state["short_id"], NAME);
+
+        let prepared = prepare_push(&db, "relay-test", &identity, &TEST_PSK).unwrap();
+        assert_eq!(prepared.topic, format!("relay-test/{UUID}"));
+        let plaintext =
+            crypto::open(&TEST_PSK, "relay-test", &prepared.topic, &prepared.sealed).unwrap();
+        let payload: Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(payload["state"]["short_id"], NAME);
+        assert_eq!(
+            safe_kv_get(&db, &format!("relay_uuid_short_{UUID}")).as_deref(),
+            Some(NAME)
+        );
+        assert_eq!(
+            safe_kv_get(&db, &format!("relay_short_{NAME}")).as_deref(),
+            Some(UUID)
+        );
+    }
+
     fn decoded_events(prepared: &PreparedPush) -> Vec<Value> {
         let plaintext =
             crypto::open(&TEST_PSK, "relay-test", &prepared.topic, &prepared.sealed).unwrap();
@@ -492,7 +528,7 @@ mod tests {
             .unwrap();
         safe_kv_set(&db, "relay_last_push_id", Some(&recent_id.to_string()));
 
-        let prepared = prepare_push(&db, "relay-test", "device-a", &TEST_PSK).unwrap();
+        let prepared = prepare_push(&db, "relay-test", &test_identity(), &TEST_PSK).unwrap();
         let events = decoded_events(&prepared);
 
         assert!(!prepared.has_more);
@@ -543,7 +579,7 @@ mod tests {
             let cursor_before: i64 = safe_kv_get(&db, "relay_last_push_id")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
-            let prepared = prepare_push(&db, "relay-test", "device-a", &TEST_PSK).unwrap();
+            let prepared = prepare_push(&db, "relay-test", &test_identity(), &TEST_PSK).unwrap();
             packet_count += 1;
             assert!(prepared.packet_bytes <= MAX_RELAY_PACKET_BYTES);
             for event in decoded_events(&prepared) {
@@ -588,7 +624,7 @@ mod tests {
             .unwrap();
         let event_id = db.conn().last_insert_rowid();
 
-        let err = prepare_push(&db, "relay-test", "device-a", &TEST_PSK).unwrap_err();
+        let err = prepare_push(&db, "relay-test", &test_identity(), &TEST_PSK).unwrap_err();
         assert!(err.contains(&format!("relay event {event_id}")));
         assert!(err.contains("cursor remains 0"));
         assert!(safe_kv_get(&db, "relay_last_push_id").is_none());
