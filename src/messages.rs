@@ -1,6 +1,6 @@
 //! Message operations — routing, scope computation, and delivery formatting.
 
-use crate::shared::{MAX_MESSAGE_SIZE, SENDER, extract_mentions};
+use crate::shared::{SENDER, extract_mentions};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -123,7 +123,8 @@ impl InstanceInfo {
 // validate_scope and validate_intent live in core::helpers — re-export for consumers.
 pub use crate::core::helpers::{validate_intent, validate_scope};
 
-/// Validate message content and size.
+/// Validate message content. Size admission is based on the complete serialized
+/// event at the database boundary, where all envelope fields are available.
 pub fn validate_message(message: &str) -> Result<(), String> {
     if message.is_empty() || message.trim().is_empty() {
         return Err("Message required".to_string());
@@ -138,13 +139,6 @@ pub fn validate_message(message: &str) -> Result<(), String> {
         {
             return Err("Message contains control characters".to_string());
         }
-    }
-
-    if message.len() > MAX_MESSAGE_SIZE {
-        return Err(format!(
-            "Message too large (max {} chars)",
-            MAX_MESSAGE_SIZE
-        ));
     }
 
     Ok(())
@@ -948,9 +942,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_message_too_large() {
-        let big = "x".repeat(MAX_MESSAGE_SIZE + 1);
-        assert!(validate_message(&big).is_err());
+    fn test_validate_message_defers_size_to_serialized_event_admission() {
+        let large = "x".repeat(crate::relay::MAX_RELAY_EVENT_BYTES);
+        assert!(validate_message(&large).is_ok());
     }
 
     // ---- format_recipients ----

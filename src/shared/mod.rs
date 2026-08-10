@@ -14,7 +14,6 @@ pub mod tool_detection;
 pub use crate::tool::Tool;
 pub use constants::{
     BIND_MARKER_RE,
-    MAX_MESSAGE_SIZE,
     MAX_MESSAGES_PER_DELIVERY,
     // Patterns
     MENTION_PATTERN,

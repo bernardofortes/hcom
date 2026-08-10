@@ -257,6 +257,58 @@ fn send_to_missing_agent_lists_available() {
 }
 
 #[test]
+fn oversized_send() {
+    let h = Hcom::new();
+    let sender = h.start();
+    let recipient = h.start();
+    let message_path = h.root_path().join("oversized-message.txt");
+    std::fs::write(&message_path, "x".repeat(64 * 1024)).unwrap();
+
+    let (code, stdout, stderr) = h.run([
+        "send",
+        &format!("@{recipient}"),
+        "--name",
+        &sender,
+        "--file",
+        message_path.to_str().unwrap(),
+    ]);
+    assert_ne!(
+        code, 0,
+        "oversized send must fail: stdout={stdout} stderr={stderr}"
+    );
+    let actual_bytes: usize = stderr
+        .split_once("relay event is ")
+        .and_then(|(_, suffix)| suffix.split_once(" bytes"))
+        .and_then(|(actual, _)| actual.parse().ok())
+        .unwrap_or_else(|| panic!("missing actual serialized size: {stderr}"));
+    assert!(actual_bytes > 64 * 1024, "stderr={stderr}");
+    assert!(
+        stderr.contains("limit is 65536 bytes"),
+        "missing allowed serialized size: {stderr}"
+    );
+    let output = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    assert!(
+        !output.contains("queued"),
+        "oversized send claimed queued: {output}"
+    );
+    assert!(
+        !output.contains("sent to"),
+        "oversized send claimed sent: {output}"
+    );
+
+    let (events_code, events, events_stderr) =
+        h.run(["events", "--type", "message", "--last", "5"]);
+    assert_eq!(
+        events_code, 0,
+        "message lookup failed: stdout={events} stderr={events_stderr}"
+    );
+    assert!(
+        events.trim().is_empty(),
+        "oversized send received an event row: {events}"
+    );
+}
+
+#[test]
 fn send_strips_redundant_trailing_name_from_auto_resolved_sender() {
     let h = Hcom::new();
     let recipient = h.start();

@@ -616,7 +616,37 @@ fn emit_rpc_result(
         "ok": ok,
         "result": result,
     });
-    let _ = db.log_event("rpc_result", "_rpc", &data);
+    let Err(error) = db.log_event("rpc_result", "_rpc", &data) else {
+        return;
+    };
+    let Some(oversized) = error.downcast_ref::<super::push::RelayEventTooLarge>() else {
+        log::log_error(
+            "relay",
+            "relay.rpc_result_persist",
+            &format!("action={action} error={error}"),
+        );
+        return;
+    };
+
+    let fallback = json!({
+        "request_id": request_id,
+        "action": action,
+        "ok": false,
+        "result": {
+            "error": format!(
+                "RPC result event is {} bytes after serialization; limit is {} bytes. Retry with a smaller range or page (for transcripts, use --range or reduce --last).",
+                oversized.actual_bytes,
+                oversized.allowed_bytes,
+            ),
+        },
+    });
+    if let Err(fallback_error) = db.log_event("rpc_result", "_rpc", &fallback) {
+        log::log_error(
+            "relay",
+            "relay.rpc_result_fallback_persist",
+            &format!("action={action} error={fallback_error}"),
+        );
+    }
 }
 
 fn resolve_remote_cwd(requested: Option<&str>) -> Result<String, String> {
@@ -994,9 +1024,9 @@ fn handle_remote_transcript(
 }
 
 const REMOTE_EVENTS_HARD_CAP: usize = 2000;
-// Cap RPC response below the rumqttc client's 128 KiB accept limit
-// (src/relay/client.rs), leaving room for envelope + AEAD overhead.
-const REMOTE_EVENTS_BYTE_CAP: usize = 98_304;
+// The handler measures the serialized result value, including JSON escaping.
+// Reserve 1 KiB for the rpc_result data and complete relay-event envelopes.
+const REMOTE_EVENTS_BYTE_CAP: usize = super::MAX_RELAY_EVENT_BYTES - 1024;
 
 fn handle_remote_events(
     db: &HcomDb,
@@ -1618,6 +1648,66 @@ mod tests {
     }
 
     #[test]
+    fn oversized_rpc_result_is_replaced_with_bounded_actionable_error() {
+        let db = test_db();
+        let oversized_content = "oversized-transcript-content".repeat(3_000);
+
+        emit_rpc_result(
+            &db,
+            "00000000-0000-0000-0000-000000000001",
+            rpc_action::TRANSCRIPT,
+            true,
+            &json!({"target": "luna", "content": oversized_content}),
+        );
+
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'rpc_result'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "only the bounded fallback may be persisted");
+
+        let result = latest_rpc_result(&db);
+        assert_eq!(result["request_id"], "00000000-0000-0000-0000-000000000001");
+        assert_eq!(result["action"], rpc_action::TRANSCRIPT);
+        assert_eq!(result["ok"], false);
+        assert!(result["result"].get("content").is_none());
+        let message = result["result"]["error"].as_str().unwrap();
+        let actual_bytes: usize = message
+            .split_once("RPC result event is ")
+            .and_then(|(_, suffix)| suffix.split_once(" bytes"))
+            .and_then(|(actual, _)| actual.parse().ok())
+            .unwrap_or_else(|| panic!("missing actual serialized size: {message}"));
+        assert!(actual_bytes > crate::relay::MAX_RELAY_EVENT_BYTES);
+        assert!(message.contains(&format!(
+            "limit is {} bytes",
+            crate::relay::MAX_RELAY_EVENT_BYTES
+        )));
+        assert!(message.contains("smaller range or page"));
+
+        let (timestamp, payload): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT timestamp, data FROM events WHERE type = 'rpc_result'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        let complete_size = crate::relay::push::local_relay_event_serialized_size(
+            &timestamp,
+            "rpc_result",
+            "_rpc",
+            &payload,
+        )
+        .unwrap();
+        assert!(complete_size <= crate::relay::MAX_RELAY_EVENT_BYTES);
+    }
+
+    #[test]
     fn test_handle_control_events_ignores_unknown_actions() {
         let db = test_db();
         let events = vec![json!({
@@ -1921,7 +2011,7 @@ mod tests {
     #[test]
     fn test_handle_remote_events_truncates_when_envelope_exceeds_cap() {
         let db = test_db();
-        // Big payload per event so a few rows blow past the 96 KiB cap.
+        // Big payload per event so a few rows exceed the bounded page budget.
         let big = "x".repeat(8_000);
         for _ in 0..20 {
             db.log_event("message", "luna", &json!({"blob": big}))
@@ -1945,6 +2035,73 @@ mod tests {
         assert!(
             envelope_len <= REMOTE_EVENTS_BYTE_CAP,
             "envelope {envelope_len} bytes exceeds cap"
+        );
+    }
+
+    #[test]
+    fn remote_events_within_event_budget_remains_successful() {
+        let db = test_db();
+        // Escaping-heavy content proves the serialized page is measured rather
+        // than estimated from the raw string length.
+        let big = "\"\\\n".repeat(2_000);
+        for i in 0..20 {
+            db.log_event("message", "luna", &json!({"i": i, "blob": big}))
+                .unwrap();
+        }
+
+        let page = handle_remote_events(
+            &db,
+            &json!({"last": 20}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(page["truncated"], true);
+        assert!(
+            page["events"]
+                .as_array()
+                .is_some_and(|events| !events.is_empty())
+        );
+        assert!(serde_json::to_vec(&page).unwrap().len() <= REMOTE_EVENTS_BYTE_CAP);
+
+        emit_rpc_result(
+            &db,
+            "00000000-0000-0000-0000-000000000002",
+            rpc_action::EVENTS,
+            true,
+            &page,
+        );
+        let result = latest_rpc_result(&db);
+        assert_eq!(
+            result["ok"], true,
+            "bounded events page must not become an error"
+        );
+        assert_eq!(result["result"]["truncated"], true);
+        assert!(
+            result["result"]["events"]
+                .as_array()
+                .is_some_and(|events| !events.is_empty())
+        );
+
+        let (timestamp, payload): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT timestamp, data FROM events WHERE type = 'rpc_result' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        let complete_size = crate::relay::push::local_relay_event_serialized_size(
+            &timestamp,
+            "rpc_result",
+            "_rpc",
+            &payload,
+        )
+        .unwrap();
+        assert!(
+            complete_size <= crate::relay::MAX_RELAY_EVENT_BYTES,
+            "complete rpc_result event is {complete_size} bytes"
         );
     }
 

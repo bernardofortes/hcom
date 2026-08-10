@@ -18,9 +18,6 @@ pub const SYSTEM_SENDER: &str = "hcom";
 /// Max messages delivered in a single hook response.
 pub const MAX_MESSAGES_PER_DELIVERY: usize = 50;
 
-/// Max message body size (1MB).
-pub const MAX_MESSAGE_SIZE: usize = 1_048_576;
-
 /// Stop hook polling interval in seconds.
 pub const STOP_HOOK_POLL_INTERVAL_SECS: f64 = 0.1;
 

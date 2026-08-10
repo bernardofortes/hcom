@@ -1460,6 +1460,53 @@ mod tests {
 
     #[test]
     #[serial]
+    fn oversized_message_reports_serialized_sizes_without_event_row() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let sender = SenderIdentity {
+            kind: SenderKind::External,
+            name: "bigboss".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let message = "x".repeat(crate::relay::MAX_RELAY_EVENT_BYTES);
+
+        let error =
+            send_message(&db, &sender, &message, None, Some(&["luna".to_string()])).unwrap_err();
+        let actual_bytes: usize = error
+            .split_once("relay event is ")
+            .and_then(|(_, suffix)| suffix.split_once(" bytes"))
+            .and_then(|(actual, _)| actual.parse().ok())
+            .unwrap_or_else(|| panic!("missing actual serialized size: {error}"));
+        assert!(actual_bytes > crate::relay::MAX_RELAY_EVENT_BYTES);
+        assert!(
+            error.contains(&format!(
+                "limit is {} bytes",
+                crate::relay::MAX_RELAY_EVENT_BYTES
+            )),
+            "missing allowed serialized size: {error}"
+        );
+
+        let message_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(message_rows, 0, "oversized message must receive no row");
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
     fn send_message_threads_seed_and_reuse_memberships() {
         let (db, path, _env) = setup_test_db();
         db.conn()
