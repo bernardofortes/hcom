@@ -120,7 +120,21 @@ pub fn handle_device_gone(db: &HcomDb, device_id: &str) {
     safe_kv_set(db, &format!("relay_ctrl_{}", device_id), None);
     safe_kv_set(db, &state_ts_key(device_id), None);
     if let Some(ref short) = short_id {
-        safe_kv_set(db, &format!("relay_short_{}", short), None);
+        let reverse_key = format!("relay_short_{}", short);
+        match safe_kv_get(db, &reverse_key) {
+            Some(owner) if owner == device_id => safe_kv_set(db, &reverse_key, None),
+            Some(owner) => log::log_warn(
+                "relay",
+                "relay.device_gone_mapping_preserved",
+                &format!(
+                    "departing_device={} short_id={} current_owner={}; preserving reverse mapping",
+                    super::device_id_prefix(device_id),
+                    short,
+                    super::device_id_prefix(&owner)
+                ),
+            ),
+            None => {}
+        }
     }
     safe_kv_set(db, &format!("relay_uuid_short_{}", device_id), None);
     let prefix = super::device_id_prefix(device_id);
@@ -1005,6 +1019,126 @@ mod tests {
             safe_kv_get(&db, "relay_caps_device-1234").as_deref(),
             Some("null"),
             "legacy peer (no capabilities field) must be cached as the \"null\" sentinel"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn remote_short_name_collision_preserves_durable_local_identity_and_mappings() {
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let legacy_path = crate::paths::legacy_device_id_path_at(&hcom_dir);
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, "local-device-uuid").unwrap();
+        std::fs::write(
+            crate::paths::device_id_path_at(&hcom_dir),
+            "local-device-uuid",
+        )
+        .unwrap();
+        std::fs::write(crate::paths::device_name_path_at(&hcom_dir), "RONI").unwrap();
+        db.kv_set("relay_uuid_short_local-device-uuid", Some("RONI"))
+            .unwrap();
+        db.kv_set("relay_uuid_short_remote-device-uuid", Some("RONI"))
+            .unwrap();
+        db.kv_set("relay_short_RONI", Some("remote-device-uuid"))
+            .unwrap();
+
+        // A reverse mapping owned by a different UUID is stale remote state,
+        // not a conflicting local identity source. Initialization reclaims it.
+        let local_identity = crate::relay::read_device_identity(&db).unwrap();
+        assert_eq!(
+            db.kv_get("relay_uuid_short_local-device-uuid")
+                .unwrap()
+                .as_deref(),
+            Some("RONI")
+        );
+        assert_eq!(
+            db.kv_get("relay_short_RONI").unwrap().as_deref(),
+            Some("local-device-uuid")
+        );
+
+        let payload = json!({
+            "state": {
+                "short_id": "RONI",
+                "reset_ts": 0.0,
+                "instances": {
+                    "intruder": {
+                        "status": "active",
+                        "context": "",
+                        "detail": "",
+                        "status_time": crate::shared::time::now_epoch_f64(),
+                        "parent": serde_json::Value::Null,
+                        "directory": "/tmp/remote",
+                        "transcript": "/tmp/remote/transcript.jsonl",
+                        "wait_timeout": 42,
+                        "last_stop": 0.0,
+                        "tcp_mode": false,
+                        "tag": serde_json::Value::Null,
+                        "tool": "codex",
+                        "background": false
+                    }
+                }
+            },
+            "events": []
+        });
+        let topic = "relay-test/remote-device-uuid";
+        let envelope = seal_for_test(&payload, topic, "relay-test");
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+
+        assert!(!handle_state_message(
+            &db,
+            "remote-device-uuid",
+            &envelope,
+            &local_identity.uuid,
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+            },
+        ));
+
+        assert!(db.get_instance_full("intruder:RONI").unwrap().is_none());
+        assert_eq!(
+            db.kv_get("relay_uuid_short_local-device-uuid")
+                .unwrap()
+                .as_deref(),
+            Some("RONI")
+        );
+        assert_eq!(
+            db.kv_get("relay_short_RONI").unwrap().as_deref(),
+            Some("local-device-uuid")
+        );
+        assert!(
+            db.kv_get("relay_uuid_short_remote-device-uuid")
+                .unwrap()
+                .is_some()
+        );
+
+        // A later retained null for the rejected UUID may clear its own forward
+        // mapping, but must not delete the reclaimed local reverse mapping.
+        handle_device_gone(&db, "remote-device-uuid");
+        assert_eq!(
+            db.kv_get("relay_short_RONI").unwrap().as_deref(),
+            Some("local-device-uuid")
+        );
+        assert!(
+            db.kv_get("relay_uuid_short_remote-device-uuid")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            crate::relay::read_device_identity(&db).unwrap(),
+            local_identity
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::device_id_path_at(&hcom_dir)).unwrap(),
+            "local-device-uuid"
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::device_name_path_at(&hcom_dir)).unwrap(),
+            "RONI"
         );
     }
 

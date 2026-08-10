@@ -119,18 +119,22 @@ fn format_time(timestamp: f64) -> String {
     format!("{} ago", format_age(age))
 }
 
-/// Get device short ID via FNV-1a hash
-/// Auto-creates device_id file if missing (via read_device_uuid).
-/// Returns "?" when the device_id file cannot be created or read — display only.
-fn get_device_short_id(db: &HcomDb) -> String {
-    match crate::relay::read_device_uuid() {
-        Some(uuid) => crate::relay::device_short_id_for_db(db, &uuid),
-        None => "?".to_string(),
-    }
+fn require_relay_identity(db: &HcomDb) -> Result<relay::DeviceIdentity, i32> {
+    relay::read_device_identity(db).map_err(|error| {
+        eprintln!("Error: invalid durable relay identity: {error}");
+        if matches!(error, relay::DeviceIdentityError::Conflict { .. }) {
+            eprintln!("Make the conflicting local identity sources agree, then retry.");
+        }
+        1
+    })
 }
 
 /// Show relay status.
 fn relay_status(db: &HcomDb) -> i32 {
+    let identity = match require_relay_identity(db) {
+        Ok(identity) => identity,
+        Err(code) => return code,
+    };
     let config = config::load_config_snapshot().core;
 
     if config.relay_id.is_empty() {
@@ -211,7 +215,7 @@ fn relay_status(db: &HcomDb) -> i32 {
         println!("Broker:    auto (public fallback)");
     }
 
-    println!("Device:    {}", get_device_short_id(db));
+    println!("Device:    {}", identity.short_name);
 
     // Queued events
     let last_push_id: i64 = db
@@ -253,7 +257,7 @@ fn relay_status(db: &HcomDb) -> i32 {
         println!("Broker-confirmed: never");
     }
 
-    let own_device = crate::relay::read_device_uuid().unwrap_or_default();
+    let own_device = identity.uuid;
     let now = crate::shared::time::now_epoch_f64();
 
     let mut device_to_short = std::collections::HashMap::new();
@@ -376,8 +380,7 @@ fn ensure_relay_worker_running_for_cli() -> bool {
     crate::relay::worker::is_relay_worker_running()
 }
 
-fn known_remote_device_shorts(db: &HcomDb) -> Vec<String> {
-    let own_device = crate::relay::read_device_uuid().unwrap_or_default();
+fn known_remote_device_shorts(db: &HcomDb, own_device: &str) -> Vec<String> {
     let mut shorts = Vec::new();
     if let Ok(entries) = db.kv_prefix("relay_short_") {
         for (key, device_id) in entries {
@@ -391,8 +394,8 @@ fn known_remote_device_shorts(db: &HcomDb) -> Vec<String> {
     shorts
 }
 
-fn relay_notify_off_all(db: &HcomDb, config: &crate::config::HcomConfig) {
-    let peers = known_remote_device_shorts(db);
+fn relay_notify_off_all(db: &HcomDb, config: &crate::config::HcomConfig, own_device: &str) {
+    let peers = known_remote_device_shorts(db, own_device);
     if peers.is_empty() {
         println!("No known remote peers to notify.");
         return;
@@ -433,7 +436,11 @@ fn relay_off(db: &HcomDb, argv: &[String]) -> i32 {
 
     if all {
         if config.relay_enabled {
-            relay_notify_off_all(db, &config);
+            let identity = match require_relay_identity(db) {
+                Ok(identity) => identity,
+                Err(code) => return code,
+            };
+            relay_notify_off_all(db, &config, &identity.uuid);
         } else {
             println!("Relay already disabled locally; skipping remote shutdown broadcast.");
         }
@@ -530,11 +537,10 @@ fn persist_relay_config(
 fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
     let (broker_url, auth_token, _) = parse_broker_flags(argv);
 
-    // Ensure device_id file exists before spawning the daemon worker,
-    // so both CLI and daemon use the same UUID (avoids TOCTOU race).
-    if relay::read_device_uuid().is_none() {
-        eprintln!("Error: failed to create device_id file");
-        return 1;
+    // Resolve the complete durable identity before spawning the daemon worker,
+    // so CLI and daemon cannot diverge or continue through a typed conflict.
+    if let Err(code) = require_relay_identity(db) {
+        return code;
     }
 
     let config = config::load_config_snapshot().core;
@@ -636,11 +642,10 @@ fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
 fn relay_connect(db: &HcomDb, argv: &[String]) -> i32 {
     let (broker_url, auth_token, remaining) = parse_broker_flags(argv);
 
-    // Ensure device_id file exists before spawning the daemon worker,
-    // so both CLI and daemon use the same UUID (avoids TOCTOU race).
-    if relay::read_device_uuid().is_none() {
-        eprintln!("Error: failed to create device_id file");
-        return 1;
+    // Resolve the complete durable identity before spawning the daemon worker,
+    // so CLI and daemon cannot diverge or continue through a typed conflict.
+    if let Err(code) = require_relay_identity(db) {
+        return code;
     }
 
     let token_str = remaining.first().filter(|s| !s.starts_with("-")).cloned();

@@ -20,8 +20,8 @@ use serde_json::json;
 
 use super::replay::ReplayGuard;
 use super::{
-    MAX_RELAY_PACKET_BYTES, get_broker_from_config, is_relay_enabled, load_psk, read_device_uuid,
-    set_relay_status, state_topic, wildcard_topic,
+    MAX_RELAY_PACKET_BYTES, get_broker_from_config, is_relay_enabled, load_psk,
+    read_device_identity, read_device_uuid, set_relay_status, state_topic, wildcard_topic,
 };
 
 /// Build a TLS config that combines webpki-roots (bundled Mozilla CAs for Android/Termux
@@ -197,8 +197,11 @@ impl MqttRelay {
         let psk = load_psk(config)?;
 
         let relay_id = config.relay_id.clone();
-        let device_uuid =
-            read_device_uuid().ok_or_else(|| "failed to create device_id file".to_string())?;
+        let identity_db = HcomDb::open()
+            .map_err(|error| format!("failed to open database for relay identity: {error}"))?;
+        let device_uuid = read_device_identity(&identity_db)
+            .map_err(|error| format!("failed to initialize relay identity: {error}"))?
+            .uuid;
         let client_id = format!("hcom-{}", super::device_id_prefix(&device_uuid));
 
         let mut mqttoptions = MqttOptions::new(&client_id, &host, port);

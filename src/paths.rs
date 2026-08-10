@@ -15,6 +15,9 @@ pub const FLAGS_DIR: &str = ".tmp/flags";
 pub const LAUNCHES_DIR: &str = "launches";
 pub const ARCHIVE_DIR: &str = "archive";
 pub const SCRIPTS_DIR: &str = "scripts";
+pub(crate) const DEVICE_ID_FILE: &str = "device_id";
+pub(crate) const DEVICE_NAME_FILE: &str = "device_name";
+pub(crate) const DEVICE_IDENTITY_LOCK_FILE: &str = "device_identity.lock";
 
 /// Resolve HCOM_DIR from an environment snapshot.
 ///
@@ -191,6 +194,22 @@ pub fn get_project_root() -> PathBuf {
 /// Get the database path (hcom_dir/hcom.db)
 pub fn db_path() -> PathBuf {
     hcom_dir().join("hcom.db")
+}
+
+pub(crate) fn device_id_path_at(base: &Path) -> PathBuf {
+    base.join(DEVICE_ID_FILE)
+}
+
+pub(crate) fn device_name_path_at(base: &Path) -> PathBuf {
+    base.join(DEVICE_NAME_FILE)
+}
+
+pub(crate) fn device_identity_lock_path_at(base: &Path) -> PathBuf {
+    base.join(DEVICE_IDENTITY_LOCK_FILE)
+}
+
+pub(crate) fn legacy_device_id_path_at(base: &Path) -> PathBuf {
+    base.join(".tmp").join(DEVICE_ID_FILE)
 }
 
 /// Get the log file path (hcom_dir/.tmp/logs/hcom.log)

@@ -173,9 +173,13 @@ fn reset_all_preserves_full_reset_behavior_in_isolated_fixture() {
     let custom_config = "[terminal]\ntitle_mode = \"name\"\n";
     std::fs::write(h.path().join("config.toml"), custom_config).unwrap();
     std::fs::write(h.path().join("config.env"), "RESET_ALL_TEST=1\n").unwrap();
-    let device_id = h.path().join(".tmp").join("device_id");
-    std::fs::create_dir_all(device_id.parent().unwrap()).unwrap();
-    std::fs::write(&device_id, "isolated-device-id").unwrap();
+    let legacy_device_id = h.path().join(".tmp").join("device_id");
+    let durable_device_id = h.path().join("device_id");
+    let durable_device_name = h.path().join("device_name");
+    std::fs::create_dir_all(legacy_device_id.parent().unwrap()).unwrap();
+    std::fs::write(&legacy_device_id, "isolated-device-id").unwrap();
+    std::fs::write(&durable_device_id, "isolated-device-id").unwrap();
+    std::fs::write(&durable_device_name, "RONI").unwrap();
 
     let (reset_code, reset_stdout, reset_stderr) = h.run(["reset", "all"]);
     assert_eq!(reset_code, 0, "stdout={reset_stdout} stderr={reset_stderr}");
@@ -191,7 +195,9 @@ fn reset_all_preserves_full_reset_behavior_in_isolated_fixture() {
         assert!(!current_config.contains("title_mode = \"name\""));
     }
     assert!(!h.path().join("config.env").exists());
-    assert!(!device_id.exists());
+    assert!(!legacy_device_id.exists());
+    assert!(!durable_device_id.exists());
+    assert!(!durable_device_name.exists());
 
     let config_archive = h.path().join("archive").join("config");
     let archived_files: Vec<std::path::PathBuf> = std::fs::read_dir(&config_archive)
@@ -230,6 +236,39 @@ fn reset_all_preserves_full_reset_behavior_in_isolated_fixture() {
         h.list_json().expect("list after reset all").is_empty(),
         "reset all should bootstrap fresh state without instances"
     );
+}
+
+#[test]
+fn relay_status_fails_on_durable_identity_conflict() {
+    let h = Hcom::new();
+    let legacy_device_id = h.path().join(".tmp").join("device_id");
+    std::fs::create_dir_all(legacy_device_id.parent().unwrap()).unwrap();
+    std::fs::write(h.path().join("device_id"), "durable-device-uuid").unwrap();
+    std::fs::write(h.path().join("device_name"), "RONI").unwrap();
+    std::fs::write(&legacy_device_id, "legacy-device-uuid").unwrap();
+
+    let (code, stdout, stderr) = h.run(["relay", "status"]);
+
+    assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stderr.contains("conflicting relay DeviceUuid"),
+        "stderr={stderr}"
+    );
+    assert!(stderr.contains("HCOM_DIR/device_id"), "stderr={stderr}");
+    assert!(
+        stderr.contains("HCOM_DIR/.tmp/device_id"),
+        "stderr={stderr}"
+    );
+    assert!(stderr.contains("durable-device-uuid"), "stderr={stderr}");
+    assert!(stderr.contains("legacy-device-uuid"), "stderr={stderr}");
+    assert!(
+        stderr.contains("Make the conflicting local identity sources agree"),
+        "stderr={stderr}"
+    );
+    assert!(!stderr.contains("failed to create device_id file"));
+    assert!(!stdout.contains("Device:    ?"), "stdout={stdout}");
+    assert!(!stdout.contains("Device:"), "stdout={stdout}");
+    assert!(!stdout.contains("Devices:"), "stdout={stdout}");
 }
 
 #[test]

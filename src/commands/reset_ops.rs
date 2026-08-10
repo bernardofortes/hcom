@@ -191,21 +191,43 @@ pub(crate) fn reset_config() -> i32 {
 }
 
 pub(crate) fn clear_full_reset_artifacts() {
-    let pidtrack = hcom_dir().join(".tmp").join("launched_pids.json");
+    if let Err(error) = clear_full_reset_artifacts_at(&hcom_dir()) {
+        crate::log::log_error("reset", "reset.identity_remove_failed", &error);
+        eprintln!("Error: Failed to clear relay identity: {error}");
+    }
+}
+
+fn clear_full_reset_artifacts_at(base: &std::path::Path) -> Result<(), String> {
+    let pidtrack = base.join(".tmp").join("launched_pids.json");
     let _ = fs::remove_file(pidtrack);
 
-    let device_id_file = hcom_dir().join(".tmp").join("device_id");
-    let _ = fs::remove_file(&device_id_file);
+    crate::relay::remove_device_identity_at(base).map_err(|error| error.to_string())?;
 
-    let instance_count_file = hcom_dir().join(FLAGS_DIR).join("instance_count");
+    let instance_count_file = base.join(FLAGS_DIR).join("instance_count");
     let _ = fs::remove_file(&instance_count_file);
+    Ok(())
 }
 
 pub(crate) fn bootstrap_fresh_db() {
-    if let Ok(fresh_db) = HcomDb::open() {
-        let _ = fresh_db.init_db();
-        let _ = fresh_db.log_reset_event();
+    if let Err(error) = bootstrap_fresh_db_at(&hcom_dir()) {
+        crate::log::log_error("reset", "reset.bootstrap_failed", &error);
+        eprintln!("Error: Failed to initialize fresh database: {error}");
     }
+}
+
+fn bootstrap_fresh_db_at(base: &std::path::Path) -> Result<(), String> {
+    let fresh_db = HcomDb::open_at(&base.join("hcom.db")).map_err(|error| error.to_string())?;
+    fresh_db.init_db().map_err(|error| error.to_string())?;
+    let identity_exists = crate::paths::device_id_path_at(base).exists()
+        || crate::paths::legacy_device_id_path_at(base).exists();
+    if identity_exists {
+        crate::relay::read_device_identity_at(base, &fresh_db)
+            .map_err(|error| error.to_string())?;
+    }
+    fresh_db
+        .log_reset_event()
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 pub(crate) fn print_archive_result(result: Result<Option<String>, String>) -> i32 {
@@ -279,5 +301,84 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(event_count, 1);
+    }
+
+    #[test]
+    fn durable_identity_reset_preserves_ordinary_reset_and_rotates_after_reset_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = crate::paths::legacy_device_id_path_at(dir.path());
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, "original-device-uuid").unwrap();
+
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.kv_set("relay_uuid_short_original-device-uuid", Some("RONI"))
+            .unwrap();
+        db.kv_set("relay_short_RONI", Some("original-device-uuid"))
+            .unwrap();
+        let original = crate::relay::read_device_identity_at(dir.path(), &db).unwrap();
+        db.log_event(
+            "message",
+            "sender",
+            &serde_json::json!({"text": "archive me"}),
+        )
+        .unwrap();
+        drop(db);
+
+        archive_and_clear_db_at(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::device_id_path_at(dir.path())).unwrap(),
+            original.uuid
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::device_name_path_at(dir.path())).unwrap(),
+            original.short_name
+        );
+
+        bootstrap_fresh_db_at(dir.path()).unwrap();
+        let fresh_db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        assert_eq!(
+            fresh_db
+                .kv_get("relay_uuid_short_original-device-uuid")
+                .unwrap()
+                .as_deref(),
+            Some("RONI")
+        );
+        assert_eq!(
+            fresh_db.kv_get("relay_short_RONI").unwrap().as_deref(),
+            Some("original-device-uuid")
+        );
+        drop(fresh_db);
+
+        archive_and_clear_db_at(dir.path()).unwrap();
+        clear_full_reset_artifacts_at(dir.path()).unwrap();
+        assert!(!crate::paths::device_id_path_at(dir.path()).exists());
+        assert!(!crate::paths::device_name_path_at(dir.path()).exists());
+        assert!(!legacy_path.exists());
+
+        // Fresh DB bootstrap does not silently recreate a factory-reset identity.
+        bootstrap_fresh_db_at(dir.path()).unwrap();
+        assert!(!crate::paths::device_id_path_at(dir.path()).exists());
+        assert!(!crate::paths::device_name_path_at(dir.path()).exists());
+        assert!(!legacy_path.exists());
+
+        let post_reset_db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let replacement =
+            crate::relay::read_device_identity_at(dir.path(), &post_reset_db).unwrap();
+        assert_ne!(replacement.uuid, original.uuid);
+        assert!(!replacement.short_name.is_empty());
+        assert_eq!(
+            post_reset_db
+                .kv_get(&format!("relay_uuid_short_{}", replacement.uuid))
+                .unwrap()
+                .as_deref(),
+            Some(replacement.short_name.as_str())
+        );
+        assert_eq!(
+            post_reset_db
+                .kv_get(&format!("relay_short_{}", replacement.short_name))
+                .unwrap()
+                .as_deref(),
+            Some(replacement.uuid.as_str())
+        );
     }
 }

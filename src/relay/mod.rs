@@ -21,6 +21,8 @@ pub use worker::observe_pid_file;
 use crate::config::HcomConfig;
 use crate::db::HcomDb;
 use crate::instance_names;
+use rusqlite::{Transaction, params};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static BACKGROUND_PUSH_SUPPRESSIONS: AtomicUsize = AtomicUsize::new(0);
@@ -176,67 +178,351 @@ pub fn get_broker_from_config(config: &HcomConfig) -> Option<(String, u16, bool)
     parse_broker_url(&config.relay)
 }
 
-/// Get or create persistent device UUID
-/// Reads from ~/.hcom/.tmp/device_id; creates with a new UUID if missing or empty.
-///
-/// Returns None only on genuine I/O failure (cannot create parent dir, cannot
-/// acquire lock, cannot persist UUID). Concurrent callers are serialized via
-/// flock on a sibling lock file, so the loser observes the winner's persisted
-/// UUID rather than racing to generate a divergent one. An existing empty file
-/// is treated as missing and refilled under lock — recovers from prior aborted
-/// writes that left a 0-byte file.
-pub fn read_device_uuid() -> Option<String> {
-    let path = crate::paths::hcom_dir().join(".tmp").join("device_id");
-    read_or_create_device_uuid_at(&path)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceIdentity {
+    pub uuid: String,
+    pub short_name: String,
 }
 
-/// Path-parameterized core of `read_device_uuid`. Split out so tests can drive
-/// it against a tempdir path without touching the global Config / HCOM_DIR env.
-fn read_or_create_device_uuid_at(path: &std::path::Path) -> Option<String> {
-    // Fast path: file already populated.
-    if let Some(uuid) = read_nonempty(path) {
-        return Some(uuid);
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceIdentityField {
+    DeviceUuid,
+    ShortName,
+}
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok()?;
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceIdentityError {
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        detail: String,
+    },
+    Database {
+        operation: &'static str,
+        detail: String,
+    },
+    Empty {
+        source: &'static str,
+    },
+    Incomplete {
+        detail: String,
+    },
+    Conflict {
+        field: DeviceIdentityField,
+        first_source: &'static str,
+        first_value: String,
+        second_source: &'static str,
+        second_value: String,
+    },
+}
 
-    // Serialize creation across processes via flock on a sibling lock file.
-    // Mirrors the pattern in instance_names::generate_unique_name.
-    let lock_path = path.with_file_name("device_id.lock");
+impl std::fmt::Display for DeviceIdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io {
+                operation,
+                path,
+                detail,
+            } => write!(f, "could not {operation} {}: {detail}", path.display()),
+            Self::Database { operation, detail } => {
+                write!(f, "could not {operation} relay identity mapping: {detail}")
+            }
+            Self::Empty { source } => write!(f, "relay identity source {source} is empty"),
+            Self::Incomplete { detail } => write!(f, "relay identity is incomplete: {detail}"),
+            Self::Conflict {
+                field,
+                first_source,
+                first_value,
+                second_source,
+                second_value,
+            } => write!(
+                f,
+                "conflicting relay {field:?}: {first_source}={first_value:?}, {second_source}={second_value:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeviceIdentityError {}
+
+fn identity_io_error(
+    operation: &'static str,
+    path: &Path,
+    error: std::io::Error,
+) -> DeviceIdentityError {
+    DeviceIdentityError::Io {
+        operation,
+        path: path.to_path_buf(),
+        detail: error.to_string(),
+    }
+}
+
+fn read_identity_file(
+    path: &Path,
+    source: &'static str,
+    empty_is_missing: bool,
+) -> Result<Option<String>, DeviceIdentityError> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let value = content.trim();
+            if value.is_empty() {
+                if empty_is_missing {
+                    Ok(None)
+                } else {
+                    Err(DeviceIdentityError::Empty { source })
+                }
+            } else {
+                Ok(Some(value.to_string()))
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(identity_io_error("read", path, error)),
+    }
+}
+
+fn acquire_device_identity_lock(base: &Path) -> Result<std::fs::File, DeviceIdentityError> {
+    crate::paths::ensure_private_directory(base)
+        .map_err(|error| identity_io_error("create", base, error))?;
+    let lock_path = crate::paths::device_identity_lock_path_at(base);
     let lock_file = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(&lock_path)
-        .ok()?;
-
-    // Held until `lock_file` drops at function scope end.
-    crate::sys::fs::lock_exclusive(&lock_file).ok()?;
-
-    // Re-check under lock — a concurrent caller may have written by now.
-    if let Some(uuid) = read_nonempty(path) {
-        return Some(uuid);
-    }
-
-    // We hold the lock; the file is missing or empty. Generate and persist.
-    let device_id = uuid::Uuid::new_v4().to_string();
-    if !crate::paths::atomic_write(path, &device_id) {
-        return None;
-    }
-    Some(device_id)
+        .map_err(|error| identity_io_error("open", &lock_path, error))?;
+    crate::sys::fs::set_private(&lock_path)
+        .map_err(|error| identity_io_error("secure", &lock_path, error))?;
+    crate::sys::fs::lock_exclusive(&lock_file)
+        .map_err(|error| identity_io_error("lock", &lock_path, error))?;
+    Ok(lock_file)
 }
 
-/// Read a file and return its trimmed content if non-empty.
-fn read_nonempty(path: &std::path::Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let trimmed = content.trim().to_string();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
+fn transaction_kv_get(
+    transaction: &Transaction<'_>,
+    key: &str,
+) -> Result<Option<String>, DeviceIdentityError> {
+    match transaction.query_row("SELECT value FROM kv WHERE key = ?", params![key], |row| {
+        row.get::<_, Option<String>>(0)
+    }) {
+        Ok(value) => Ok(value),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(DeviceIdentityError::Database {
+            operation: "read",
+            detail: error.to_string(),
+        }),
     }
+}
+
+fn require_nonempty_db_value(
+    value: Option<String>,
+    source: &'static str,
+) -> Result<Option<String>, DeviceIdentityError> {
+    match value {
+        Some(value) if value.trim().is_empty() => Err(DeviceIdentityError::Empty { source }),
+        Some(value) => Ok(Some(value.trim().to_string())),
+        None => Ok(None),
+    }
+}
+
+fn identity_conflict(
+    field: DeviceIdentityField,
+    first_source: &'static str,
+    first_value: &str,
+    second_source: &'static str,
+    second_value: &str,
+) -> DeviceIdentityError {
+    DeviceIdentityError::Conflict {
+        field,
+        first_source,
+        first_value: first_value.to_string(),
+        second_source,
+        second_value: second_value.to_string(),
+    }
+}
+
+fn persist_device_identity_files(
+    base: &Path,
+    identity: &DeviceIdentity,
+    durable_uuid: Option<&str>,
+    durable_name: Option<&str>,
+    legacy_uuid: Option<&str>,
+) -> Result<(), DeviceIdentityError> {
+    let legacy_path = crate::paths::legacy_device_id_path_at(base);
+    let name_path = crate::paths::device_name_path_at(base);
+    let uuid_path = crate::paths::device_id_path_at(base);
+
+    // The durable UUID is the commit marker for a fresh migration. Legacy is
+    // written first for BBF4 rollback, then the name, then the canonical UUID.
+    if legacy_uuid != Some(identity.uuid.as_str()) {
+        crate::paths::atomic_write_io(&legacy_path, &identity.uuid)
+            .map_err(|error| identity_io_error("write", &legacy_path, error))?;
+    }
+    if durable_name != Some(identity.short_name.as_str()) {
+        crate::paths::atomic_write_io(&name_path, &identity.short_name)
+            .map_err(|error| identity_io_error("write", &name_path, error))?;
+    }
+    if durable_uuid != Some(identity.uuid.as_str()) {
+        crate::paths::atomic_write_io(&uuid_path, &identity.uuid)
+            .map_err(|error| identity_io_error("write", &uuid_path, error))?;
+    }
+    for path in [&legacy_path, &name_path, &uuid_path] {
+        crate::sys::fs::set_private(path)
+            .map_err(|error| identity_io_error("secure", path, error))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn read_device_identity_at(
+    base: &Path,
+    db: &HcomDb,
+) -> Result<DeviceIdentity, DeviceIdentityError> {
+    let _identity_lock = acquire_device_identity_lock(base)?;
+
+    // Every source is deliberately re-read under the cross-process lock.
+    let uuid_path = crate::paths::device_id_path_at(base);
+    let name_path = crate::paths::device_name_path_at(base);
+    let legacy_path = crate::paths::legacy_device_id_path_at(base);
+    let durable_uuid = read_identity_file(&uuid_path, "HCOM_DIR/device_id", false)?;
+    let durable_name = read_identity_file(&name_path, "HCOM_DIR/device_name", false)?;
+    let legacy_uuid = read_identity_file(&legacy_path, "HCOM_DIR/.tmp/device_id", true)?;
+
+    if let (Some(durable), Some(legacy)) = (&durable_uuid, &legacy_uuid)
+        && durable != legacy
+    {
+        return Err(identity_conflict(
+            DeviceIdentityField::DeviceUuid,
+            "HCOM_DIR/device_id",
+            durable,
+            "HCOM_DIR/.tmp/device_id",
+            legacy,
+        ));
+    }
+    if durable_name.is_some() && durable_uuid.is_none() && legacy_uuid.is_none() {
+        return Err(DeviceIdentityError::Incomplete {
+            detail: "HCOM_DIR/device_name exists without a UUID source".to_string(),
+        });
+    }
+
+    let device_uuid = durable_uuid
+        .clone()
+        .or_else(|| legacy_uuid.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let uuid_key = relay_uuid_short_key(&device_uuid);
+
+    let result = db.with_immediate_transaction(|transaction| {
+        let db_name = require_nonempty_db_value(
+            transaction_kv_get(transaction, &uuid_key)?,
+            "SQLite relay_uuid_short_<uuid>",
+        )?;
+        if let (Some(durable), Some(mapped)) = (&durable_name, &db_name)
+            && durable != mapped
+        {
+            return Err(identity_conflict(
+                DeviceIdentityField::ShortName,
+                "HCOM_DIR/device_name",
+                durable,
+                "SQLite relay_uuid_short_<uuid>",
+                mapped,
+            )
+            .into());
+        }
+
+        let short_name = durable_name
+            .clone()
+            .or(db_name)
+            .unwrap_or_else(|| device_short_id(&device_uuid));
+        let short_key = relay_short_key(&short_name);
+        let reverse_owner = require_nonempty_db_value(
+            transaction_kv_get(transaction, &short_key)?,
+            "SQLite relay_short_<name>",
+        )?;
+        if let Some(owner) = reverse_owner
+            && owner != device_uuid
+        {
+            crate::log::log_warn(
+                "relay",
+                "relay.identity_reverse_claim",
+                &format!(
+                    "short_name={short_name} local_uuid={device_uuid} stale_owner={owner}; reclaiming durable local mapping"
+                ),
+            );
+        }
+
+        let identity = DeviceIdentity {
+            uuid: device_uuid.clone(),
+            short_name,
+        };
+        persist_device_identity_files(
+            base,
+            &identity,
+            durable_uuid.as_deref(),
+            durable_name.as_deref(),
+            legacy_uuid.as_deref(),
+        )?;
+
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)",
+                params![uuid_key, identity.short_name],
+            )
+            .map_err(|error| DeviceIdentityError::Database {
+                operation: "restore UUID-to-name",
+                detail: error.to_string(),
+            })?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)",
+                params![relay_short_key(&identity.short_name), identity.uuid],
+            )
+            .map_err(|error| DeviceIdentityError::Database {
+                operation: "restore name-to-UUID",
+                detail: error.to_string(),
+            })?;
+        Ok(identity)
+    });
+
+    match result {
+        Ok(identity) => Ok(identity),
+        Err(error) => match error.downcast::<DeviceIdentityError>() {
+            Ok(identity_error) => Err(identity_error),
+            Err(error) => Err(DeviceIdentityError::Database {
+                operation: "initialize",
+                detail: error.to_string(),
+            }),
+        },
+    }
+}
+
+/// Return the one durable local relay identity, creating or migrating it when
+/// needed. Conflicts and persistence failures are fatal and never fall back.
+pub fn read_device_identity(db: &HcomDb) -> Result<DeviceIdentity, DeviceIdentityError> {
+    read_device_identity_at(&crate::paths::hcom_dir(), db)
+}
+
+/// Transitional UUID-only adapter for consumers moved in Slice 4. Initialization
+/// still goes through the typed durable authority; errors produce no fallback.
+pub fn read_device_uuid() -> Option<String> {
+    let db = HcomDb::open().ok()?;
+    read_device_identity(&db).ok().map(|identity| identity.uuid)
+}
+
+pub(crate) fn remove_device_identity_at(base: &Path) -> Result<(), DeviceIdentityError> {
+    let _identity_lock = acquire_device_identity_lock(base)?;
+    for path in [
+        crate::paths::device_id_path_at(base),
+        crate::paths::device_name_path_at(base),
+        crate::paths::legacy_device_id_path_at(base),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(identity_io_error("remove", &path, error)),
+        }
+    }
+    // Keep the lock path: unlinking a held lock lets a concurrent caller lock a
+    // new inode while a waiter still owns the old one, defeating serialization.
+    Ok(())
 }
 
 const RELAY_SHORT_PREFIX: &str = "relay_short_";
@@ -967,84 +1253,291 @@ mod tests {
         assert!(!is_relay_enabled(&config));
     }
 
+    fn identity_test_db(base: &Path) -> HcomDb {
+        HcomDb::open_at(&base.join("hcom.db")).unwrap()
+    }
+
+    fn write_legacy_device_id(base: &Path, value: &str) {
+        let path = crate::paths::legacy_device_id_path_at(base);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, value).unwrap();
+    }
+
+    #[test]
+    fn durable_device_identity_migrates_legacy_uuid_and_assigned_name_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = identity_test_db(tmp.path());
+        write_legacy_device_id(tmp.path(), "legacy-device-uuid");
+        db.kv_set("relay_uuid_short_legacy-device-uuid", Some("RONI"))
+            .unwrap();
+        db.kv_set("relay_short_RONI", Some("legacy-device-uuid"))
+            .unwrap();
+
+        let identity = read_device_identity_at(tmp.path(), &db).unwrap();
+        assert_eq!(
+            identity,
+            DeviceIdentity {
+                uuid: "legacy-device-uuid".to_string(),
+                short_name: "RONI".to_string(),
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::device_id_path_at(tmp.path())).unwrap(),
+            "legacy-device-uuid"
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::device_name_path_at(tmp.path())).unwrap(),
+            "RONI"
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::legacy_device_id_path_at(tmp.path())).unwrap(),
+            "legacy-device-uuid"
+        );
+
+        // Matching durable, legacy, and database sources remain valid on restart.
+        assert_eq!(read_device_identity_at(tmp.path(), &db).unwrap(), identity);
+        assert_eq!(
+            db.kv_get("relay_uuid_short_legacy-device-uuid")
+                .unwrap()
+                .as_deref(),
+            Some("RONI")
+        );
+        assert_eq!(
+            db.kv_get("relay_short_RONI").unwrap().as_deref(),
+            Some("legacy-device-uuid")
+        );
+    }
+
+    #[test]
+    fn durable_device_identity_concurrent_migration_callers_agree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::sync::Arc::new(tmp.path().to_path_buf());
+        let db = identity_test_db(base.as_ref());
+        write_legacy_device_id(base.as_ref(), "legacy-device-uuid");
+        db.kv_set("relay_uuid_short_legacy-device-uuid", Some("RONI"))
+            .unwrap();
+        db.kv_set("relay_short_RONI", Some("legacy-device-uuid"))
+            .unwrap();
+        drop(db);
+
+        let n = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let base = std::sync::Arc::clone(&base);
+                std::thread::spawn(move || {
+                    let db = identity_test_db(base.as_ref());
+                    barrier.wait();
+                    read_device_identity_at(base.as_ref(), &db)
+                })
+            })
+            .collect();
+
+        let expected = DeviceIdentity {
+            uuid: "legacy-device-uuid".to_string(),
+            short_name: "RONI".to_string(),
+        };
+        for handle in handles {
+            assert_eq!(handle.join().unwrap().unwrap(), expected);
+        }
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::device_id_path_at(base.as_ref())).unwrap(),
+            expected.uuid
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::device_name_path_at(base.as_ref())).unwrap(),
+            expected.short_name
+        );
+    }
+
+    #[test]
+    fn durable_device_identity_creates_complete_identity_and_preserves_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = identity_test_db(tmp.path());
+
+        let identity = read_device_identity_at(tmp.path(), &db).unwrap();
+        assert!(!identity.uuid.is_empty());
+        assert!(is_cvcv_upper(&identity.short_name));
+        assert_eq!(read_device_identity_at(tmp.path(), &db).unwrap(), identity);
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::device_id_path_at(tmp.path())).unwrap(),
+            identity.uuid
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::device_name_path_at(tmp.path())).unwrap(),
+            identity.short_name
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::legacy_device_id_path_at(tmp.path())).unwrap(),
+            identity.uuid
+        );
+    }
+
+    #[test]
+    fn durable_device_identity_conflict_rejects_uuid_mismatch_without_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = identity_test_db(tmp.path());
+        std::fs::write(crate::paths::device_id_path_at(tmp.path()), "durable-uuid").unwrap();
+        std::fs::write(crate::paths::device_name_path_at(tmp.path()), "RONI").unwrap();
+        write_legacy_device_id(tmp.path(), "legacy-uuid");
+        db.kv_set("relay_uuid_short_durable-uuid", Some("RONI"))
+            .unwrap();
+        db.kv_set("relay_short_RONI", Some("durable-uuid")).unwrap();
+
+        let error = read_device_identity_at(tmp.path(), &db).unwrap_err();
+        assert!(matches!(
+            error,
+            DeviceIdentityError::Conflict {
+                field: DeviceIdentityField::DeviceUuid,
+                ..
+            }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::device_id_path_at(tmp.path())).unwrap(),
+            "durable-uuid"
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::device_name_path_at(tmp.path())).unwrap(),
+            "RONI"
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::legacy_device_id_path_at(tmp.path())).unwrap(),
+            "legacy-uuid"
+        );
+        assert_eq!(
+            db.kv_get("relay_uuid_short_durable-uuid")
+                .unwrap()
+                .as_deref(),
+            Some("RONI")
+        );
+    }
+
+    #[test]
+    fn durable_device_identity_conflict_rejects_name_mismatch_without_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = identity_test_db(tmp.path());
+        std::fs::write(crate::paths::device_id_path_at(tmp.path()), "durable-uuid").unwrap();
+        std::fs::write(crate::paths::device_name_path_at(tmp.path()), "RONI").unwrap();
+        write_legacy_device_id(tmp.path(), "durable-uuid");
+        db.kv_set("relay_uuid_short_durable-uuid", Some("GIGA"))
+            .unwrap();
+        db.kv_set("relay_short_GIGA", Some("durable-uuid")).unwrap();
+
+        let error = read_device_identity_at(tmp.path(), &db).unwrap_err();
+        assert!(matches!(
+            error,
+            DeviceIdentityError::Conflict {
+                field: DeviceIdentityField::ShortName,
+                ..
+            }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::device_name_path_at(tmp.path())).unwrap(),
+            "RONI"
+        );
+        assert_eq!(
+            db.kv_get("relay_uuid_short_durable-uuid")
+                .unwrap()
+                .as_deref(),
+            Some("GIGA")
+        );
+        assert_eq!(
+            db.kv_get("relay_short_GIGA").unwrap().as_deref(),
+            Some("durable-uuid")
+        );
+        assert!(db.kv_get("relay_short_RONI").unwrap().is_none());
+    }
+
     #[test]
     fn test_read_device_uuid_creates_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(".tmp").join("device_id");
-        let uuid = read_or_create_device_uuid_at(&path).expect("should create");
-        assert!(!uuid.is_empty());
-        // Subsequent call must return the SAME persisted UUID.
-        let again = read_or_create_device_uuid_at(&path).expect("should read");
-        assert_eq!(uuid, again);
+        let db = identity_test_db(tmp.path());
+        let identity = read_device_identity_at(tmp.path(), &db).expect("should create");
+        assert!(!identity.uuid.is_empty());
+        assert!(!identity.short_name.is_empty());
+        assert_eq!(
+            identity,
+            read_device_identity_at(tmp.path(), &db).expect("should read")
+        );
     }
 
     #[test]
     fn test_read_device_uuid_repairs_empty_file() {
-        // Regression: prior implementation used create_new which refused to
-        // replace an existing-but-empty file, so a 0-byte device_id (left by
-        // an aborted write) caused permanent None.
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".tmp");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("device_id");
-        std::fs::write(&path, "").unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        write_legacy_device_id(tmp.path(), "");
+        let db = identity_test_db(tmp.path());
 
-        let uuid = read_or_create_device_uuid_at(&path).expect("should repair");
-        assert!(!uuid.is_empty());
-        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), uuid);
+        let identity = read_device_identity_at(tmp.path(), &db).expect("should repair");
+        assert!(!identity.uuid.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::legacy_device_id_path_at(tmp.path()))
+                .unwrap()
+                .trim(),
+            identity.uuid
+        );
     }
 
     #[test]
     fn test_read_device_uuid_repairs_whitespace_only_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".tmp");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("device_id");
-        std::fs::write(&path, "   \n\t  ").unwrap();
+        write_legacy_device_id(tmp.path(), "   \n\t  ");
+        let db = identity_test_db(tmp.path());
 
-        let uuid = read_or_create_device_uuid_at(&path).expect("should repair");
-        assert!(!uuid.is_empty());
-        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), uuid);
+        let identity = read_device_identity_at(tmp.path(), &db).expect("should repair");
+        assert!(!identity.uuid.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::legacy_device_id_path_at(tmp.path()))
+                .unwrap()
+                .trim(),
+            identity.uuid
+        );
     }
 
     #[test]
     fn test_read_device_uuid_concurrent_first_callers_agree() {
-        // Regression: concurrent first callers used to each generate their own
-        // UUID, return their own in-memory copy, and disagree on disk. With
-        // flock + read-under-lock, all callers must observe the SAME UUID.
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(".tmp").join("device_id");
+        let base = std::sync::Arc::new(tmp.path().to_path_buf());
+        // Create the schema before releasing concurrent identity callers.
+        drop(identity_test_db(base.as_ref()));
 
         let n = 8;
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
-        let path_arc = std::sync::Arc::new(path.clone());
-
         let handles: Vec<_> = (0..n)
             .map(|_| {
-                let b = std::sync::Arc::clone(&barrier);
-                let p = std::sync::Arc::clone(&path_arc);
+                let barrier = std::sync::Arc::clone(&barrier);
+                let base = std::sync::Arc::clone(&base);
                 std::thread::spawn(move || {
-                    b.wait();
-                    read_or_create_device_uuid_at(&p)
+                    let db = identity_test_db(base.as_ref());
+                    barrier.wait();
+                    read_device_identity_at(base.as_ref(), &db)
                 })
             })
             .collect();
 
-        let results: Vec<Option<String>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-
-        let first = results[0].as_ref().expect("at least one must succeed");
-        for (i, r) in results.iter().enumerate() {
-            let r = r
-                .as_ref()
-                .unwrap_or_else(|| panic!("thread {i} returned None"));
+        let results: Vec<DeviceIdentity> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().expect("caller should succeed"))
+            .collect();
+        let first = &results[0];
+        for (index, identity) in results.iter().enumerate() {
             assert_eq!(
-                r, first,
-                "thread {i} got divergent UUID — race not serialized"
+                identity, first,
+                "thread {index} got a divergent complete identity"
             );
         }
-        // And the persisted file matches.
-        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), first);
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::device_id_path_at(base.as_ref())).unwrap(),
+            first.uuid
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::device_name_path_at(base.as_ref())).unwrap(),
+            first.short_name
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::legacy_device_id_path_at(base.as_ref())).unwrap(),
+            first.uuid
+        );
     }
 
     // ── RelayHealth derivation matrix ────────────────────────────────
