@@ -1052,6 +1052,268 @@ impl Drop for RelayGuard {
     }
 }
 
+const TEST_RELAY_EVENT_BUDGET: usize = 64 * 1024;
+
+fn message_events_containing(hcom_dir: &str, marker: &str) -> Vec<(i64, serde_json::Value)> {
+    let db = rusqlite::Connection::open(Path::new(hcom_dir).join("hcom.db"))
+        .expect("open disposable hcom database");
+    let mut statement = db
+        .prepare(
+            "SELECT id, data FROM events
+             WHERE type = 'message'
+               AND instr(json_extract(data, '$.text'), ?1) > 0
+             ORDER BY id",
+        )
+        .expect("prepare marker event query");
+    statement
+        .query_map(rusqlite::params![marker], |row| {
+            let id = row.get(0)?;
+            let data: String = row.get(1)?;
+            Ok((id, data))
+        })
+        .expect("query marker events")
+        .map(|row| {
+            let (id, data) = row.expect("read marker event");
+            let data = serde_json::from_str(&data).expect("marker event data must be JSON");
+            (id, data)
+        })
+        .collect()
+}
+
+fn relay_kv(hcom_dir: &str, key: &str) -> Option<String> {
+    let db = rusqlite::Connection::open(Path::new(hcom_dir).join("hcom.db")).ok()?;
+    db.query_row(
+        "SELECT value FROM kv WHERE key = ?1",
+        rusqlite::params![key],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+#[test]
+#[ignore]
+fn oversized_rejection_does_not_block_following_event() {
+    kill_orphan_debug_daemons();
+
+    let dir_a = tempfile::tempdir().expect("failed to create temp dir A");
+    let dir_b = tempfile::tempdir().expect("failed to create temp dir B");
+    let dir_a_path = dir_a.keep();
+    let dir_b_path = dir_b.keep();
+    let guard = RelayGuard {
+        dir_a: Some(dir_a_path.clone()),
+        dir_b: Some(dir_b_path.clone()),
+        local_kill_b: RefCell::new(Vec::new()),
+    };
+    let path_a = dir_a_path.to_string_lossy().to_string();
+    let path_b = dir_b_path.to_string_lossy().to_string();
+    let log = TestLog::new();
+
+    logln!(
+        log,
+        "Oversize rejection followed by a real MQTT marker roundtrip"
+    );
+    let relay_new = check("A", "relay new", &path_a);
+    let token = parse_token(&relay_new).expect("Could not parse token from relay new output");
+    check("B", &format!("relay connect {token}"), &path_b);
+
+    for (label, hcom_dir) in [("A", &path_a), ("B", &path_b)] {
+        poll_until(
+            || {
+                let out = hcom_with_dir("relay status", hcom_dir);
+                if out.status.success()
+                    && String::from_utf8_lossy(&out.stdout)
+                        .to_ascii_lowercase()
+                        .contains("connected")
+                {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+            &format!("Device {label} relay connected"),
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+        );
+    }
+
+    let clean_status = poll_until(
+        || {
+            let out = hcom_with_dir("relay status", &path_a);
+            if !out.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            stdout.contains("Queued:    up to date").then_some(stdout)
+        },
+        "Device A starts with a broker-confirmed clean queue",
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    assert!(clean_status.contains("Broker-confirmed:"));
+
+    let short_a = parse_device_id(&clean_status).expect("Could not parse Device A short ID");
+    let uuid_a = fs::read_to_string(dir_a_path.join("device_id"))
+        .expect("read Device A durable UUID")
+        .trim()
+        .to_string();
+    assert!(
+        !uuid_a.is_empty(),
+        "Device A durable UUID must not be empty"
+    );
+    let relay_pid_path_a = dir_a_path.join(".tmp").join("relay.pid");
+    let relay_pid_a = fs::read_to_string(&relay_pid_path_a)
+        .expect("read Device A relay PID before rejection")
+        .trim()
+        .to_string();
+
+    let run_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let rejected_marker = format!("relay-rejected-{run_id}");
+    let oversized_path = dir_a_path.join("oversized-message.txt");
+    fs::write(
+        &oversized_path,
+        format!("{rejected_marker}:{}", "x".repeat(TEST_RELAY_EVENT_BUDGET)),
+    )
+    .expect("write deterministic oversized message");
+    let oversized = hcom_with_dir(
+        &format!(
+            "send --from relaytest --file {}",
+            shell_words::quote(&oversized_path.to_string_lossy())
+        ),
+        &path_a,
+    );
+    let oversized_stdout = String::from_utf8_lossy(&oversized.stdout).to_string();
+    let oversized_stderr = String::from_utf8_lossy(&oversized.stderr).to_string();
+    assert!(
+        !oversized.status.success(),
+        "oversized send must fail\nstdout: {oversized_stdout}\nstderr: {oversized_stderr}"
+    );
+    let actual_bytes: usize = oversized_stderr
+        .split_once("relay event is ")
+        .and_then(|(_, suffix)| suffix.split_once(" bytes"))
+        .and_then(|(actual, _)| actual.parse().ok())
+        .unwrap_or_else(|| panic!("missing actual serialized size: {oversized_stderr}"));
+    assert!(
+        actual_bytes > TEST_RELAY_EVENT_BUDGET,
+        "actual serialized size must exceed the event budget: {oversized_stderr}"
+    );
+    assert!(
+        oversized_stderr.contains(&format!("limit is {TEST_RELAY_EVENT_BUDGET} bytes")),
+        "missing allowed serialized size: {oversized_stderr}"
+    );
+    let oversized_output = format!("{oversized_stdout}\n{oversized_stderr}").to_ascii_lowercase();
+    assert!(
+        !oversized_output.contains("queued") && !oversized_output.contains("sent to"),
+        "oversized send claimed success: {oversized_output}"
+    );
+    assert!(
+        message_events_containing(&path_a, &rejected_marker).is_empty(),
+        "rejected original received a local event row/ID"
+    );
+
+    let cursor_before_marker: i64 = relay_kv(&path_a, "relay_last_push_id")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let accepted_marker = format!("relay-after-rejection-{run_id}");
+    let accepted = hcom_with_dir(
+        &format!("send --from relaytest -- {accepted_marker}"),
+        &path_a,
+    );
+    assert!(
+        accepted.status.success(),
+        "following marker send failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&accepted.stdout),
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let local_marker_rows = message_events_containing(&path_a, &accepted_marker);
+    assert_eq!(
+        local_marker_rows.len(),
+        1,
+        "following marker must have exactly one local event row"
+    );
+    let marker_event_id = local_marker_rows[0].0;
+    assert!(
+        marker_event_id > cursor_before_marker,
+        "marker ID must start beyond the pre-send broker cursor"
+    );
+
+    let confirmed_status = poll_until(
+        || {
+            let out = hcom_with_dir("relay status", &path_a);
+            if !out.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let cursor = relay_kv(&path_a, "relay_last_push_id")
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0);
+            let broker_confirmed = relay_kv(&path_a, "relay_last_push")
+                .and_then(|value| value.parse::<f64>().ok())
+                .is_some_and(|value| value > 0.0);
+            (cursor >= marker_event_id
+                && broker_confirmed
+                && stdout.contains("Queued:    up to date")
+                && !stdout.contains("Broker-confirmed: never"))
+            .then_some(stdout)
+        },
+        "Device A advances its durable cursor through the marker after broker confirmation",
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    logln!(
+        log,
+        "  OK: marker event #{marker_event_id} is broker-confirmed; {}",
+        confirmed_status
+            .lines()
+            .find(|line| line.starts_with("Queued:"))
+            .unwrap_or("Queued status missing")
+    );
+
+    let (remote_event, remote_data) = poll_until(
+        || {
+            message_events_containing(&path_b, &accepted_marker)
+                .into_iter()
+                .next()
+        },
+        "Device B receives and decodes the exact following marker",
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    assert_eq!(remote_data["text"].as_str(), Some(accepted_marker.as_str()));
+    let expected_from = format!("relaytest:{short_a}");
+    assert_eq!(remote_data["from"].as_str(), Some(expected_from.as_str()));
+    assert_eq!(
+        remote_data["_relay"]["device"].as_str(),
+        Some(uuid_a.as_str())
+    );
+    assert_eq!(
+        remote_data["_relay"]["short"].as_str(),
+        Some(short_a.as_str())
+    );
+    assert_eq!(remote_data["_relay"]["id"].as_i64(), Some(marker_event_id));
+    assert!(
+        remote_event > 0,
+        "imported marker must receive a local ID on B"
+    );
+    assert!(
+        message_events_containing(&path_b, &rejected_marker).is_empty(),
+        "Device B received the rejected original"
+    );
+    let relay_pid_after = fs::read_to_string(&relay_pid_path_a)
+        .expect("read Device A relay PID after roundtrip")
+        .trim()
+        .to_string();
+    assert_eq!(
+        relay_pid_after, relay_pid_a,
+        "Device A relay daemon restarted after the rejection"
+    );
+
+    logln!(
+        log,
+        "  OK: Device B decoded the exact marker with Device A's durable relay metadata"
+    );
+    drop(guard);
+}
+
 // ── Main test ──────────────────────────────────────────────────────────
 
 #[test]
